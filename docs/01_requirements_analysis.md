@@ -1,0 +1,323 @@
+# Requirements Analysis - Task Force 3 Self-Heal Engine - CDO-02
+
+**Doc owner:** CDO-02  
+**Trạng thái:** Ready for W11 Pack #1 review  
+**Cập nhật lần cuối:** 2026-06-25 (sync AI commit 86b32e7)  
+
+## 1. Bối cảnh đề tài
+
+Task Force 3 xây dựng **Self-Heal Engine** cho một nền tảng SaaS B2B đang vận hành hơn 200 microservices trên Kubernetes/EKS. Client là VP Engineering, đang gặp vấn đề on-call quá tải vì mỗi đêm có 2-4 page, trong đó khoảng 80% là các known patterns lặp lại như Pod OOMKilled, service stuck, queue backlog, cert expiring.
+
+Client muốn xây một hệ thống tự động hóa xử lý sự cố theo pipeline:
+
+```text
+detect -> match runbook -> execute audited action -> verify -> escalate nếu fail
+```
+
+CDO-02 không xây AI model. Vai trò của CDO-02 là xây platform/infra để Self-Heal Engine chạy an toàn trên Kubernetes sandbox: nhận alert, gom context, gọi AI endpoint, kiểm tra safety gate, dry-run, execute action, verify kết quả, rollback/escalate nếu fail và ghi audit log.
+
+## 2. Problem Statement
+
+On-call engineers hiện đang mất nhiều thời gian cho các thao tác lặp lại, đặc biệt là những action có runbook rõ như restart deployment, scale worker hoặc xử lý OOMKilled. Nếu tự động hóa không có kiểm soát, hệ thống có thể gây unsafe action trên Kubernetes như thao tác sai namespace, scale quá mức, rollback sai target hoặc thiếu audit trail.
+
+Vì vậy, yêu cầu của CDO-02 không chỉ là "gọi AI rồi execute", mà là xây một platform có guardrails rõ ràng:
+
+- AI chỉ đưa ra decision/action plan.
+- CDO enforce safety gate trước khi execute.
+- Mọi action phải có dry-run, blast-radius, local rollback/runbook path, `verify_policy` và audit.
+- Multi-tenant isolation phải rõ ràng giữa ít nhất 2 tenants.
+- Nếu AI timeout, confidence thấp hoặc action không an toàn thì CDO không execute, mà escalate và ghi audit.
+
+## 3. Phạm vi CDO-02 phụ trách
+
+CDO-02 sẽ phụ trách các phần sau:
+
+| Hạng mục | Trách nhiệm của CDO-02 |
+|---|---|
+| Platform architecture | Thiết kế workflow alert -> AI -> safety -> execute -> verify -> audit |
+| Kubernetes sandbox | EKS/Kubernetes cluster, namespaces, sample workloads |
+| Multi-tenant isolation | Ít nhất `tenant-a` và `tenant-b`, tách namespace và RBAC |
+| Safety gate | Validate tenant, namespace, confidence threshold, action allow-list, `allowed_namespaces`, blast-radius, `verify_policy` |
+| Execution layer | Executor/operator-style workflow để restart/scale/rollback theo action plan |
+| Audit | Ghi audit log theo `correlation_id`, retention target >= 90 ngày |
+| Observability | Logs, metrics, Kubernetes events; ưu tiên CloudWatch/Container Insights |
+| Deployment/IaC | Terraform skeleton cho VPC, EKS, observability |
+| AI integration | Consume 3 AI contracts, gọi AI endpoint theo schema đã ký |
+
+## 4. Ngoài Phạm Vi
+
+CDO-02 không làm các phần sau trong scope capstone:
+
+- Không build AI model hoặc decision engine.
+- Không cho AI gọi Kubernetes trực tiếp.
+- Không làm production traffic; chỉ sandbox + synthetic workload.
+- Không làm multi-cluster federation.
+- Không auto-discover pattern mới; chỉ implement/design known patterns.
+- Không làm real PagerDuty/OpsGenie; Slack/mock pager là đủ.
+- Không làm hash-chain crypto audit; S3 Object Lock hoặc append-only audit là đủ.
+- Không làm cross-region replication.
+- Không làm mTLS; bearer token/JWT là đủ cho capstone.
+
+## 5. Hướng Khác Biệt Của CDO-02
+
+- **Angle chọn:** K8s-heavy / Kubernetes Workflow Orchestration.
+- **Why this angle:** TF3 là bài toán self-healing cho microservices chạy trên Kubernetes/EKS, nên CDO-02 chọn Kubernetes-native workflow để thao tác trực tiếp với workload, enforce RBAC theo namespace, kiểm soát blast-radius, dry-run, rollback, verify và audit. Trục tối ưu chính là **reliability** và **operational control**.
+- **Trade-off chấp nhận:** Chi phí và độ phức tạp vận hành cao hơn serverless-first, nhưng đổi lại sát đề bài hơn, dễ chứng minh tenant isolation/RBAC hơn và phù hợp với self-heal trên Kubernetes workload.
+- **Locked T3 W11:** 2026-06-23.
+
+## 6. Pattern Mục Tiêu / Phạm Vi Dataset
+
+Theo contract hiện tại của AI, phạm vi dữ liệu được căn theo **RE2/RE3 dataset** và hệ thống mẫu **Online Boutique**. Vì vậy CDO-02 cần align pattern demo với các signals/actions mà AI contract đã định nghĩa, thay vì tự đặt pattern theo tên quá chung chung.
+
+### 6.1 Patterns build thật
+
+CDO-02 build thật 4 patterns (confirmed với AI contract):
+
+| Pattern | Signal kích hoạt | Action | pattern_type |
+|---|---|---|---|
+| Service stuck / latency spike | `service_latency_p95`, `service_unhealthy` | `RESTART_DEPLOYMENT` | urgent |
+| Error rate spike / code-level fault | `service_error_rate`, `application_log_event`, `distributed_trace_error_event` | `RESTART_DEPLOYMENT` hoặc escalate | urgent |
+| Memory pressure / OOM | `container_resource_usage`, `pod_oom_event` | `PATCH_MEMORY_LIMIT` hoặc escalate | urgent |
+| Secret/cert expiry | `secret_expiry_warning` | `ROTATE_SECRET` (với allow-list + verify_policy bắt buộc) | deferred |
+
+### 6.2 Patterns design-only
+
+CDO-02 giữ 1 pattern design-only:
+
+| Pattern | Action thiết kế | Lý do design-only |
+|---|---|---|
+| Queue/backpressure | `SCALE_REPLICAS` | Cần dữ liệu `queue_backlog` rõ từ dataset; implement nếu kịp W12 |
+
+Danh sách pattern đã confirmed với AI team và khớp với contracts đã ký 2026-06-25.
+
+## 7. Yêu Cầu Phi Chức Năng Cho Infra
+
+| NFR | Target | Justification |
+|---|---|---|
+| Multi-tenant isolation | >= 2 tenants trong sandbox | Hard requirement của TF3 |
+| Auto-resolve rate | >= 60% trên >= 10 scenarios | Hard requirement của TF3 |
+| Scenario simulation | >= 4h test window | Hard requirement của TF3 |
+| Unsafe action | 0 unsafe action | Không delete prod namespace, không IAM modify |
+| Audit retention | >= 90 ngày | SOC2/compliance requirement |
+| Safety checkpoint | Dry-run, blast-radius, verify, rollback, circuit breaker | Hard requirement của TF3 |
+| AI endpoint timeout handling | Timeout/503 -> no execute, escalate + audit | Prevent unsafe automated action |
+| Observability | Logs + metrics + traces theo AI contract | Cần đủ dữ liệu cho detect/decide/verify và trace end-to-end |
+| Cost control | W11 draft estimate, W12 refine with evidence | Tránh over-architecting |
+
+## 8. Điểm Cần Làm Rõ Với Client/Trainer
+
+Các điểm dưới đây cần hỏi trainer/mentor đóng vai client trước khi chốt final, vì nếu tự giả định sai thì có thể ảnh hưởng thiết kế W12.
+
+| Chủ đề | Câu hỏi cần hỏi trainer/client | Ảnh hưởng nếu chưa chốt |
+|---|---|---|
+| Sandbox environment | T6/W12 có bắt buộc dùng EKS thật không, hay Kubernetes sandbox/local được chấp nhận nếu có evidence rõ? | Ảnh hưởng infra design và deployment plan |
+| Region | Client/trainer có bắt buộc `us-east-1` theo brief không? | Ảnh hưởng Terraform variables, cost estimate, deployment |
+| Audit storage | Audit có bắt buộc S3 Object Lock không, hay append-only log/DB được chấp nhận cho capstone? | Ảnh hưởng security design và cost |
+| Auto-resolved definition | Một incident được tính auto-resolved khi action execute thành công hay khi metrics trở lại normal sau verify? | Ảnh hưởng test report và success criteria |
+| Blast-radius limit | Một lần self-heal được thao tác tối đa bao nhiêu deployment/replica/namespace? | Ảnh hưởng safety gate |
+| Escalation policy | Retry mấy lần trước khi escalate? Escalation message cần format Slack/Markdown/JSON? | Ảnh hưởng workflow và AI response |
+| Observability requirement | Traces trong AI contract cần triển khai đầy đủ ở W12 hay chấp nhận phased implementation? | Ảnh hưởng tool choice: CloudWatch, Prometheus, X-Ray/OpenTelemetry |
+| Offline simulation | AI contract đã định nghĩa Mock Mode cho RE2/RE3; cần trainer xác nhận Mock Mode có đủ evidence cho W12 demo không. | Ảnh hưởng demo và test evidence |
+
+Trong khi chờ trainer/client confirm, CDO-02 sẽ ghi các điểm này là **assumption**, không xem là quyết định cuối cùng.
+
+## 9. Phụ Thuộc Contract Giữa AI Và CDO
+
+AI team đã publish 3 contracts tại repo `AIops-g4/Capstone-Phase-2-Code/tf-3/ai/contracts`. CDO-02 cập nhật requirement theo các điểm chính dưới đây.
+
+Mục tiêu của CDO-02 trong Pack #1 là chứng minh platform design **consume được contract của AI**, không tự thiết kế lệch interface. Các phần telemetry, API integration, security và deployment của CDO-02 sẽ bám theo 3 contract này, trừ các điểm cần push-back/clarify ở mục 9.4.
+
+### 9.1 Telemetry Contract
+
+CDO-02 cần thu thập/chuẩn hóa và gửi các signals sau cho AI:
+
+| Signal | CDO responsibility | Used for |
+|---|---|---|
+| `service_error_rate` | Tính từ error/request counters theo cửa sổ trượt | Detect và verify lỗi service |
+| `service_latency_p95` | Đọc latency p95 từ metrics source | Detect service stuck/latency spike |
+| `service_throughput_rps` | Đọc RPS theo cửa sổ trượt từ Prometheus/OTel | Detect tải bất thường, hỗ trợ scale decision |
+| `application_log_event` | Parse logs ERROR/stack trace sau khi scrub PII/secret | Diagnose code-level fault |
+| `distributed_trace_error_event` | Parse traces có lỗi span | Diagnose lỗi liên dịch vụ |
+| `container_resource_usage` | Đọc memory working set bytes theo container/pod | Detect memory pressure/OOM prevention |
+| `pod_oom_event` | K8s Node lifecycle event khi container bị OOMKilled | Trigger urgent `PATCH_MEMORY_LIMIT` hoặc escalate |
+| `container_restart_count` | kube-state-metrics restart counter | Detect CrashLoopBackOff → `ROLLOUT_UNDO` |
+| `service_unhealthy` | K8s Kubelet probe fail event | Trigger urgent `RESTART_DEPLOYMENT` |
+| `queue_backlog` | SQS/RabbitMQ message backlog metrics | Detect nghẽn hàng đợi → deferred `SCALE_REPLICAS` |
+| `db_connection_pool_saturation` | Database monitor / APM agent | Detect cạn kiệt connection pool |
+| `secret_expiry_warning` | Secrets Manager / Cert Manager event | Trigger deferred `ROTATE_SECRET` |
+
+Yêu cầu chung từ AI contract:
+
+- Mọi signal phải có `tenant_id`.
+- Với CDO-02, tenant ID là `6c8b4b2b-4d45-4209-a1b4-4b532d56a31c` — **confirmed** trong deployment contract 2026-06-25.
+- Timestamp dùng RFC3339 UTC.
+- Với RE2/RE3, CDO preprocessor đọc `metrics.csv`, `logs.csv`, `traces.csv`, chuẩn hóa signal rồi đưa vào executor/AI API path. SQS chỉ là buffer nội bộ nếu CDO tự chọn, vì AI contract mới chưa cung cấp queue ARN.
+- CDO phải lọc/mã hóa PII trước khi gửi log sang AI.
+
+CDO-02 sẽ đáp ứng bằng cách:
+
+- Thiết kế telemetry pipeline ưu tiên CloudWatch/Container Insights/Prometheus-compatible metrics.
+- Với Offline Simulation Mode, thiết kế preprocessor đọc CSV RE2/RE3 và gửi signal đã chuẩn hóa vào executor. Nếu dùng SQS, CDO owns queue cho tới khi AI xác nhận queue contract.
+- Chuẩn hóa metrics/logs/traces thành JSON trước khi gọi AI API.
+- Gắn `tenant_id`, `correlation_id` và timestamp UTC cho mọi request.
+- Với W11 Pack #1, mô tả schema và nguồn dữ liệu; W12 mới thu evidence thật từ sandbox.
+- Traces được giữ trong schema theo AI contract; mức triển khai thực tế sẽ được chốt trong W12 plan và phụ thuộc thời gian tích hợp OpenTelemetry/X-Ray.
+
+### 9.2 AI API Contract
+
+Endpoint AI cung cấp:
+
+```text
+POST /v1/detect
+POST /v1/decide
+POST /v1/verify
+```
+
+Authentication và headers (bắt buộc cho mọi request):
+
+```text
+Authorization: IAM SigV4  ← BẮT BUỘC kể cả khi AI chạy in-cluster (confirmed)
+X-Tenant-Id: 6c8b4b2b-4d45-4209-a1b4-4b532d56a31c
+Idempotency-Key: UUID v4 (bắt buộc cho CẢ BA endpoints)
+X-Dry-Run-Mode: "true" hoặc "false" (bắt buộc cho cả ba endpoints)
+X-Correlation-Id: UUID v4 (tùy chọn cho detect, bắt buộc cho decide/verify)
+```
+
+> **Ghi chú auth (confirmed 2026-06-25)**: Dù AI Engine deploy in-cluster (ClusterIP service), CDO Executor vẫn phải sign request bằng **IAM SigV4** theo AI API Contract. CDO Executor cần dùng IRSA/EKS Pod Identity để lấy credentials tự động; không hardcode key.
+
+Luồng tích hợp:
+
+```text
+/v1/detect -> AI trả anomaly_detected, severity, anomaly_context, confidence, reasoning, correlation_id
+/v1/decide -> AI trả matched_runbook, pattern_type, action_plan[], blast_radius_config, verify_policy, cost_cap_exceeded
+CDO execute/mock execute action (theo pattern_type: urgent = direct K8s; deferred = Git commit/PR)
+/v1/verify -> CDO gửi idempotency_key, dry_run_mode, action_executed + post_telemetry_window; AI trả success, regression_detected, next_action, escalation_bundle nếu cần
+```
+
+Các action AI contract định nghĩa (enum cố định):
+
+```text
+RESTART_DEPLOYMENT
+PATCH_MEMORY_LIMIT
+SCALE_REPLICAS
+ROLLOUT_UNDO
+ROTATE_SECRET
+```
+
+**Xử lý `pattern_type` (CDO bắt buộc phân biệt):**
+
+- `pattern_type: "urgent"` → CDO execute trực tiếp qua Kubernetes API sau khi safety gate pass.
+- `pattern_type: "deferred"` → CDO **không được** direct mutate Kubernetes; phải tạo Git commit hoặc PR để GitOps sync về cluster.
+
+**Xử lý `cost_cap_exceeded: true`:** AI chuyển sang rule-based fallback. CDO vẫn execute action plan bình thường nhưng cần log cảnh báo và thông báo team.
+
+SLA/API behavior từ contract (cập nhật W11):
+
+- `/v1/detect` p99 < 300ms.
+- `/v1/decide` p99 < 3000ms (LLM Bedrock); fallback rule-based p99 < 500ms.
+- `/v1/verify` p99 < 500ms.
+- Availability target 99.9%.
+- Rate limit: `/v1/detect` 100 RPS/tenant; `/v1/decide` và `/v1/verify` 10 RPS/tenant.
+- `400`: không retry tự động.
+- `409`: trùng `Idempotency-Key`.
+- `429`: exponential backoff (response có header `Retry-After`).
+- `503`: CDO phải fallback bằng static runbook hoặc escalation.
+
+CDO-02 sẽ đáp ứng bằng cách:
+
+- Xây executor/safety gate consume `action_plan[]` từ `/v1/decide`.
+- Chỉ execute các action nằm trong allow-list của contract mới: `RESTART_DEPLOYMENT`, `PATCH_MEMORY_LIMIT`, `SCALE_REPLICAS`, `ROLLOUT_UNDO`, `ROTATE_SECRET`.
+- `ROTATE_SECRET` được xác nhận là **build thật** (confirmed từ AI contract). CDO implement với safety gate đầy đủ: chỉ thực thi khi signal `secret_expiry_warning` trigger, target `secret_name` phải nằm trong allow-list đã định nghĩa, và bắt buộc có `verify_policy`.
+- Validate `tenant_id`, target namespace, `allowed_namespaces`, blast-radius, local rollback/runbook path và `verify_policy` trước khi execute.
+- Dùng `Idempotency-Key` (bắt buộc cho cả ba endpoints, UUID v4) để tránh execute trùng một incident.
+- Gửi `X-Dry-Run-Mode` header bắt buộc cho mọi request.
+- Với `pattern_type: "urgent"`: execute trực tiếp qua Kubernetes API sau safety gate.
+- Với `pattern_type: "deferred"`: **không direct mutate Kubernetes**; tạo Git commit/PR để ArgoCD sync.
+- Khi nhận `cost_cap_exceeded: true`: log cảnh báo, vẫn execute action plan, thông báo team.
+- Với `429`, dùng retry/backoff theo contract (header `Retry-After`).
+- Với `503`, mặc định không tự ý execute; CDO sẽ escalate + audit, trừ khi static runbook fallback đã được AI/CDO thống nhất.
+
+### 9.3 Deployment Contract
+
+Theo contract AI:
+
+- Theo contract AI mới nhất tại commit `08ed368`, AI Engine được triển khai theo mô hình **Self-Hosted (In-Cluster)**.
+- AI team bàn giao **OCI-compliant container image** để CDO-02 tự pull và deploy trực tiếp vào EKS của mình.
+- Endpoint tích hợp mục tiêu không còn là shared endpoint dùng chung, mà là service nội bộ trong cluster, ví dụ:
+  `http://ai-engine.self-heal-system.svc.cluster.local:8080/`
+- Auth: IAM SigV4.
+- Tenant ID cho CDO-02: `6c8b4b2b-4d45-4209-a1b4-4b532d56a31c` (**confirmed** trong deployment contract 2026-06-25).
+- AI service chạy trong namespace `self-heal-system`, port `8080`, không public Internet.
+- Health endpoints: `GET /health`, `GET /ready`, `GET /metrics`.
+- Logs: CloudWatch Logs.
+- Metrics: Prometheus endpoint.
+- Traces: OpenTelemetry -> Jaeger hoặc AWS X-Ray.
+- Audit: S3 Object Lock Compliance Mode, retention tối thiểu 90 ngày.
+
+CDO-02 sẽ đáp ứng bằng cách:
+
+- Thiết kế network path để CDO executor gọi AI endpoint nội bộ theo deployment contract.
+- Sử dụng IAM SigV4 theo yêu cầu auth của AI.
+- Gắn tenant ID `6c8b4b2b-4d45-4209-a1b4-4b532d56a31c` cho requests của CDO-02.
+- Ghi log request/response theo `correlation_id` để trace được end-to-end.
+- Thiết kế audit storage tương thích S3 Object Lock 90 ngày.
+- Tách rõ AI endpoint là decision service; CDO executor là nơi enforce safety và execute action, trừ khi AI/CDO thống nhất lại boundary khác.
+
+### 9.4 Các điểm đã chốt với AI (resolved 2026-06-25)
+
+Deployment contract mới đã chốt ranh giới theo hướng CDO-02 yêu cầu: **AI chỉ decide, CDO executor mới mutate Kubernetes**. AI Engine không giữ kubeconfig và không gọi Kubernetes/EKS API trực tiếp.
+
+Tất cả các điểm dưới đây đã được xác nhận trong 3 contracts đã ký:
+
+- ✅ Tenant UUID `6c8b4b2b-4d45-4209-a1b4-4b532d56a31c` — confirmed trong deployment contract.
+- ✅ SQS là internal CDO buffer (CDO owns). AI không pull từ SQS — confirmed trong telemetry contract section 2.5.C.
+- ✅ `X-Dry-Run-Mode` header bắt buộc cho cả ba endpoints.
+- ✅ `Idempotency-Key` bắt buộc cho cả ba endpoints.
+- ✅ `/v1/decide` SLA p99 < 3000ms (LLM Bedrock), < 500ms (fallback rule-based).
+- ✅ Rate limit: `/v1/detect` 100 RPS/tenant; `/v1/decide` và `/v1/verify` 10 RPS/tenant.
+- ✅ `pattern_type: "deferred"` — CDO tạo Git commit/PR, không direct mutate K8s.
+- ✅ Dead-Letter Queue (DLQ) bắt buộc khi telemetry bị AI reject (400) — confirmed telemetry contract section 2.5.B.
+
+## 10. Giả Định
+
+- Team chính thức là **CDO-02**.
+- CDO-02 đã chốt angle **K8s-heavy / Kubernetes Workflow Orchestration**.
+- Sandbox target là AWS/EKS, nhưng mức bắt buộc chạy thật ở T6 cần trainer xác nhận.
+- Region mặc định theo client brief là `us-east-1`, trừ khi trainer/mentor yêu cầu khác.
+- Observability theo contract AI gồm CloudWatch Logs, Prometheus metrics endpoint và OpenTelemetry traces về Jaeger hoặc AWS X-Ray.
+- Audit storage theo contract AI là S3 Object Lock Compliance Mode, retention tối thiểu 90 ngày.
+- Idempotency lock theo deployment contract AI dùng DynamoDB conditional write hoặc Redis lock TTL 5 phút; CDO-02 ưu tiên DynamoDB để khớp AWS-native design.
+- CDO-02 có thể dùng mock/skeleton AI endpoint từ T6 W11 đến trước integration session W12.
+
+## 11. Câu Hỏi Mở
+
+Tổng hợp trạng thái các câu hỏi với AI team và trainer/mentor.
+
+### 11.1 Đã chốt với AI team (resolved 2026-06-25)
+
+1. ✅ **4 build patterns confirmed**: service stuck/latency spike, error rate spike/code-level fault, memory pressure/OOM, secret/cert expiry.
+2. ✅ **1 design-only**: queue/backpressure (`SCALE_REPLICAS`); implement nếu kịp W12.
+3. ✅ Signal naming đã chuẩn hóa theo telemetry contract mới (ví dụ: `service_error_rate`, không phải `istio_request_error_rate`).
+4. ✅ **Offline Simulation Mode / Mock Mode** — AI contract đã định nghĩa Mock Mode cho RE2/RE3 (deployment contract section Offline Simulation Mode). Trainer confirm là đủ evidence cho W12 demo.
+5. ✅ **AI skeleton endpoint URL** — endpoint nội bộ: `http://ai-engine.self-heal-system.svc.cluster.local:8080/` (confirmed deployment contract). CDO dùng endpoint này khi deploy AI image vào EKS.
+6. ✅ **503 fallback**: CDO escalate + audit, không execute mặc định (static runbook fallback nếu AI/CDO đã thống nhất).
+7. ✅ **SQS CDO-internal**: confirmed trong telemetry contract section 2.5.C.
+
+### 11.2 Cần xác nhận với trainer/mentor (W12)
+
+1. Trainer có bắt buộc S3 Object Lock cho audit không, hay append-only log được chấp nhận? — CDO-02 giả định S3 Object Lock Compliance Mode (theo deployment contract), sẽ confirm với trainer trước W12.
+2. Trainer có yêu cầu region khác `us-east-1` không? — CDO-02 giả định `us-east-1` theo client brief.
+3. Trainer có yêu cầu base infra T6 phải chạy thật hoàn toàn không, hay skeleton + plan + commit evidence được chấp nhận? — CDO-02 target EKS thật; escalate mentor nếu setup bị block.
+
+## 12. Checklist Hoàn Thành Pack #1
+
+- [x] CDO angle locked. (K8s-heavy, AI boundary: AI decides, CDO executes — locked T3 W11)
+- [x] Build/design-only patterns confirmed with AI. (4 build-real, 1 design-only — confirmed 2026-06-25)
+- [x] AI contract open questions documented và resolved. (Section 11.1 — tất cả 7 items đã ✅)
+- [x] NFR table reviewed by team. (Section 7)
+- [x] Giả định đã được xác nhận hoặc đánh dấu là rủi ro. (Section 10)
+- [x] Tenant ID confirmed. (`6c8b4b2b-4d45-4209-a1b4-4b532d56a31c` — confirmed deployment contract 2026-06-25)
+- [x] 12 telemetry signals aligned với AI telemetry contract. (Section 9.1)
+- [x] IAM SigV4 bắt buộc confirmed. (Section 9.2)
+- [x] ROTATE_SECRET confirmed build thật. (Section 6.1, Section 9.2)
+- [ ] File committed as Pack #1 evidence. (chờ git commit)

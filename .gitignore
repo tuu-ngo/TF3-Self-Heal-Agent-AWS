@@ -1,0 +1,7 @@
+.terraform/
+**/.terraform/
+*.tfplan
+*.tfstate
+*.tfstate.backup
+crash.log
+ai-team-repo/
