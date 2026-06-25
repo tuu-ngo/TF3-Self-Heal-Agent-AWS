@@ -66,24 +66,29 @@ Trong scope capstone, **sandbox** là môi trường duy nhất cần implement.
 
 ### 1.3 Quản lý state
 
-CDO-02 dùng chiến lược quản lý state như sau:
+**Trạng thái hiện tại: Local state — known gap, chấp nhận cho capstone scope.**
 
-- Remote state trên S3 cho `sandbox`.
-- S3 lockfile để tránh race condition khi có nhiều người chạy deploy.
-- `terraform plan` là gate bắt buộc trên pull request.
-- `terraform apply` chỉ được chạy sau khi đã review và merge.
+Terraform state hiện đang lưu local tại `infra/envs/dev/terraform.tfstate`. Đây là known gap được chấp nhận có chủ đích vì:
 
-Trạng thái thực thi hiện tại:
+- Capstone chỉ có 1 người chạy `terraform apply` tại một thời điểm → không có race condition thực tế.
+- Setup S3 backend cần tạo bucket trước khi có infra → bootstrap chicken-and-egg problem trong giai đoạn W11.
+- Ưu tiên W11 là có skeleton/evidence commit, không phải hoàn thiện pipeline.
 
-- Policy/thiết kế đã chốt theo hướng S3 backend.
-- Implementation thực tế trong repo vẫn cần bổ sung block `backend "s3"` và quy trình migrate state.
+**Quy tắc bắt buộc khi dùng local state:**
 
-Lợi ích của cách này:
+- Chỉ một người chạy `terraform apply` tại một thời điểm — thông báo team trước khi chạy.
+- Commit `terraform.tfstate` lên Git sau mỗi lần apply thành công để team có state mới nhất.
+- Không commit `terraform.tfstate.backup`.
+- `terraform plan` bắt buộc review trước khi apply.
 
-- Giảm rủi ro ghi đè state.
-- Tạo audit trail rõ hơn cho thay đổi hạ tầng.
-- Phù hợp với deployment process có approval gate.
-- Đơn giản hơn cho team vì không cần thêm DynamoDB table chỉ để lock state.
+**Known risk:**
+
+| Risk | Mức độ | Mitigate |
+|---|---|---|
+| Hai người apply cùng lúc → state conflict | Thấp (1 người apply) | Thông báo team qua standup/Slack |
+| State file chứa output values (ARN, endpoint) → lộ trong Git | Trung bình | Không commit secret thật vào state; dùng placeholder cho sensitive outputs |
+
+**Target W12 nếu kịp:** Migrate lên S3 backend (`backend "s3"` + S3 lockfile). Không block W11 delivery.
 
 ## 2. CI/CD pipeline
 
@@ -222,10 +227,34 @@ spec:
   syncPolicy:
     automated:
       prune: false       # không xóa resource tự động
-      selfHeal: true     # tự sync khi phát hiện drift
+      selfHeal: false    # ← QUAN TRỌNG: tắt cho workload namespaces
     syncOptions:
       - CreateNamespace=false
 ```
+
+**Tại sao `selfHeal: false` cho workload namespaces (`tenant-a`, `tenant-b`, `platform`)?**
+
+`selfHeal: true` có nghĩa ArgoCD liên tục so sánh cluster ↔ Git, nếu cluster khác Git thì **tự động revert cluster về Git**. Điều này xung đột trực tiếp với urgent path:
+
+```text
+CDO urgent path: PATCH_MEMORY_LIMIT → cluster đổi memory limit ngay
+ArgoCD selfHeal: phát hiện cluster ≠ Git → revert memory limit về cũ
+→ Pod OOM lại → AI detect lại → CDO patch lại → ArgoCD revert lại → vòng lặp vô tận
+```
+
+Với `selfHeal: false`:
+- ArgoCD vẫn auto-sync khi **Git thay đổi** (CI/CD bình thường, không bị ảnh hưởng)
+- ArgoCD **không revert** khi cluster bị CDO urgent path thay đổi
+- Sau khi incident resolved, CDO hoặc pipeline commit manifest cập nhật lên Git → ArgoCD sync lần tiếp theo là đúng
+
+Bảng `selfHeal` theo namespace:
+
+| Namespace | `selfHeal` | Lý do |
+|---|---|---|
+| `tenant-a`, `tenant-b` | `false` | CDO urgent path cần mutate cluster mà không bị revert |
+| `platform` | `false` | CDO executor chạy ở đây, cũng chịu urgent action |
+| `argocd` | `true` | Infrastructure — chỉ update qua pipeline, không ai sửa tay |
+| `self-heal-system` | `true` | AI Engine pod — chỉ update qua deploy pipeline |
 
 `prune: false` đảm bảo ArgoCD không tự xóa resource khi manifest bị remove — cần approval thủ công cho destructive action.
 
@@ -247,6 +276,58 @@ Khi AI trả `pattern_type: "deferred"` (ví dụ: `ROTATE_SECRET`, `SCALE_REPLI
 ```
 
 Thời gian tổng thể của deferred path: ~2–5 phút (Git commit + ArgoCD polling + sync + verify).
+
+### 3.5.1 Rollback của deferred path
+
+Deferred path có 3 điểm có thể fail, mỗi điểm có cách rollback riêng:
+
+**Điểm 1 — ArgoCD sync fail (ví dụ: manifest YAML sai, resource conflict)**
+
+```text
+Executor phát hiện ArgoCD sync status = SyncFailed hoặc Health = Degraded
+→ Executor tạo revert commit: khôi phục manifest về nội dung trước khi patch
+→ ArgoCD phát hiện revert commit → sync lại về trạng thái cũ
+→ Executor ghi audit: deferred_sync_failed, revert_commit_created
+→ Escalate với context bundle (commit hash, ArgoCD error, correlation_id)
+```
+
+**Điểm 2 — `/v1/verify` trả regression sau khi ArgoCD sync thành công**
+
+```text
+ArgoCD sync thành công, nhưng metrics xấu hơn sau action
+→ Executor tạo revert commit: khôi phục manifest về revision trước
+→ ArgoCD sync lại về cũ
+→ Executor ghi audit: deferred_verify_regression, revert_commit_created
+→ Escalate
+```
+
+**Điểm 3 — Executor timeout chờ ArgoCD (quá `verify_policy.window_seconds`)**
+
+```text
+ArgoCD không sync xong trong thời gian cho phép
+→ Executor không gọi /v1/verify
+→ Tạo revert commit để đảm bảo cluster về trạng thái safe
+→ Ghi audit: deferred_sync_timeout, revert_commit_created
+→ Escalate
+```
+
+**Cơ chế revert commit:**
+
+```text
+Revert commit không phải git revert lệnh — executor đọc nội dung manifest
+trước khi patch (lưu trong memory hoặc audit log) và ghi lại file gốc,
+sau đó commit lên Git. ArgoCD tự sync về. Không cần git history manipulation.
+```
+
+**Bảng tóm tắt:**
+
+| Failure point | Trigger | CDO action | Kubernetes bị ảnh hưởng? |
+|---|---|---|---|
+| ArgoCD SyncFailed | sync status ≠ Synced trong timeout | Revert commit + escalate | Chưa bị thay đổi (sync chưa xong) |
+| verify regression | /v1/verify trả regression=true | Revert commit + escalate | Đã thay đổi → revert về cũ |
+| Executor timeout | window_seconds hết mà sync chưa xong | Revert commit + escalate | Tùy trạng thái ArgoCD sync |
+
+> **Lưu ý**: Khác với urgent path (dùng `kubectl rollout undo`), deferred path rollback luôn đi qua Git commit → ArgoCD sync. CDO không bao giờ direct mutate Kubernetes trong deferred path, kể cả khi rollback.
 
 ### 3.6 Git repo manifest cho deferred path
 

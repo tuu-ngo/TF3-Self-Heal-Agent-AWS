@@ -286,7 +286,7 @@ Tất cả các điểm dưới đây đã được xác nhận trong 3 contract
 - Region mặc định theo client brief là `us-east-1`, trừ khi trainer/mentor yêu cầu khác.
 - Observability theo contract AI gồm CloudWatch Logs, Prometheus metrics endpoint và OpenTelemetry traces về Jaeger hoặc AWS X-Ray.
 - Audit storage theo contract AI là S3 Object Lock Compliance Mode, retention tối thiểu 90 ngày.
-- Idempotency lock theo deployment contract AI dùng DynamoDB conditional write hoặc Redis lock TTL 5 phút; CDO-02 ưu tiên DynamoDB để khớp AWS-native design.
+- Idempotency lock theo deployment contract AI dùng DynamoDB conditional write; TTL 24 giờ để ngăn replay attack và duplicate execution trong vòng 1 ngày. CDO-02 ưu tiên DynamoDB để khớp AWS-native design.
 - CDO-02 có thể dùng mock/skeleton AI endpoint từ T6 W11 đến trước integration session W12.
 
 ## 11. Câu Hỏi Mở

@@ -188,6 +188,16 @@ Secrets dự kiến:
 | Kube access | Kubernetes ServiceAccount token | CDO executor |
 | Audit bucket config | Terraform variables/outputs | Executor/deploy pipeline |
 | Idempotency lock table config | Terraform outputs / env var | CDO executor |
+| **ArgoCD Git credential** (pull manifest repo) | ArgoCD `repo` Secret trong namespace `argocd` — dùng GitHub App private key hoặc SSH deploy key | ArgoCD repo-server |
+| **CDO executor Git credential** (push commit deferred path) | Kubernetes Secret trong namespace `platform` — GitHub App token, mount vào executor pod qua env var | CDO executor (deferred path only) |
+
+**Lưu ý quan trọng về Git credential:**
+
+- ArgoCD cần credential để **pull** manifest repo (đọc manifest để sync vào cluster).
+- CDO executor cần credential riêng để **push** commit lên manifest repo (deferred path tạo Git commit).
+- Hai credential này **không dùng chung** — least privilege: ArgoCD chỉ cần read, executor chỉ cần write vào `manifests/<tenant>/`.
+- Không dùng personal access token tĩnh — dùng GitHub App token (short-lived, scoped per repo).
+- GitHub App token phải được rotate định kỳ hoặc tạo on-demand qua GitHub App installation API.
 
 Controls:
 
@@ -195,7 +205,7 @@ Controls:
 - Không log bearer token, SigV4 headers đầy đủ hoặc kube token.
 - Redact PII và credential-like strings trong logs.
 - Ưu tiên IRSA thay vì static AWS keys trong pod.
-- Idempotency lock dùng DynamoDB conditional write hoặc Redis TTL theo deployment contract; CDO-02 ưu tiên DynamoDB để tránh static state trong pod.
+- Idempotency lock dùng DynamoDB conditional write, TTL 24 giờ. 5 phút là quá ngắn — nếu executor restart sau 5 phút, cùng một incident có thể execute lại vì key đã expire. 24 giờ đảm bảo không có duplicate execution trong cùng một ngày vận hành.
 
 ## 8. Audit Logging
 
@@ -264,7 +274,7 @@ Phần này liệt kê các tình huống nguy hiểm và control tương ứng.
 
 - ~~Confirm tenant UUID chính thức của CDO-02 với AI.~~ **Resolved: `6c8b4b2b-4d45-4209-a1b4-4b532d56a31c`** (confirmed trong deployment contract AI commit 86b32e7).
 - ~~SQS ownership~~: **Resolved**: SQS là internal buffer của CDO. AI không pull từ SQS.
-- Confirm confidence threshold chính xác để CDO execute action (chưa có con số cụ thể trong contract).
+- ✅ Confidence threshold: `>= 0.8` → execute; `< 0.8` → escalate + audit (CDO-02 assumption, không có contract constraint cụ thể).
 - ~~Confirm `ROTATE_SECRET` policy cho demo~~: **Resolved** — `ROTATE_SECRET` là build thật. Safety gate enforce: signal `secret_expiry_warning` → target `secret_name` phải trong allow-list → `pattern_type: deferred` → GitOps path, không direct mutate.
 - Trainer có bắt buộc S3 Object Lock thật cho W11/T6 không, hay W12 mới cần evidence?
 - Traces có bắt buộc phải triển khai đầy đủ trong W12 demo không?

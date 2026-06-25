@@ -47,10 +47,11 @@ Scope cost CDO-02 bao gồm: VPC/networking, EKS cluster, observability stack, a
 | NAT Gateway | 1 single NAT (demo/cost choice) | $0.045/h + $0.045/GB | $1.08 | **$10.80** |
 | NAT Gateway data processed | ~5 GB/ngày ước tính | $0.045/GB | $0.23 | **$2.25** |
 | VPC Endpoints (S3, CloudWatch, DynamoDB) | 3 interface endpoints | $0.01/h/endpoint | $0.72 | **$7.20** |
+| VPC Endpoints (ECR API + ECR DKR) | 2 interface endpoints — bắt buộc để EKS pull AI container image từ ECR qua private subnet | $0.01/h/endpoint × 2 | $0.48 | **$4.80** |
 | Data transfer inter-AZ | ~1 GB/ngày | $0.01/GB | $0.01 | **$0.10** |
-| **Subtotal VPC** | | | **$2.04/ngày** | **~$20.35** |
+| **Subtotal VPC** | | | **$2.52/ngày** | **~$25.15** |
 
-> Ghi chú: Dùng **Single NAT Gateway** như ghi trong architecture diagram để tối ưu cost cho demo. NAT cần thiết vì EKS nodes nằm trong Private Subnets - dùng để pull ECR images (W12) và các external outbound traffic còn lại sau khi đã có VPC Endpoints cho S3/CloudWatch/DynamoDB. Production sẽ cần NAT per-AZ cho HA.
+> Ghi chú: Dùng **Single NAT Gateway** như ghi trong architecture diagram để tối ưu cost cho demo. ECR cần 2 VPC endpoints (`ecr.api` và `ecr.dkr`) để EKS nodes trong private subnet pull được AI container image mà không phải đi qua NAT — nếu thiếu 2 endpoints này, toàn bộ image pull traffic đi qua NAT và tốn thêm data transfer cost. Production sẽ cần NAT per-AZ cho HA.
 
 ### 3.3 Amazon S3 - Audit & State
 
@@ -69,7 +70,7 @@ Scope cost CDO-02 bao gồm: VPC/networking, EKS cluster, observability stack, a
 |---|---|---|---|---|
 | DynamoDB On-Demand (Write) | ~5,000 WCU/ngày (1 WCU = 1KB write) | $1.25/million WCU | $0.006 | **$0.06** |
 | DynamoDB On-Demand (Read) | ~10,000 RCU/ngày | $0.25/million RCU | $0.003 | **$0.03** |
-| DynamoDB storage | < 1 GB (TTL auto-delete sau 5 phút) | $0.25/GB/month | negligible | **< $0.01** |
+| DynamoDB storage | < 1 GB (TTL auto-delete sau 24 giờ) | $0.25/GB/month | negligible | **< $0.01** |
 | **Subtotal DynamoDB** | | | **~$0.01/ngày** | **~$0.10** |
 
 ### 3.5 Amazon SQS - Telemetry Buffer & DLQ
@@ -135,7 +136,7 @@ Components chạy trong EKS cluster (Prometheus, Alertmanager, Grafana, OTel Col
 | Thành phần | Ước tính 10 ngày | % tổng |
 |---|---:|---:|
 | Amazon EKS (cluster + nodes) | $50.00 | 50.0% |
-| VPC & Networking (NAT + VPC Endpoints) | $20.35 | 20.3% |
+| VPC & Networking (NAT + VPC Endpoints + ECR endpoints) | $25.15 | 23.5% |
 | CloudWatch (logs + metrics + alarms) | $15.53 | 15.5% |
 | Amazon ECR | $0.29 | 0.3% |
 | Amazon S3 (audit + state) | $0.55 | 0.5% |
@@ -143,7 +144,7 @@ Components chạy trong EKS cluster (Prometheus, Alertmanager, Grafana, OTel Col
 | Amazon SQS | $0.00 | 0.0% |
 | Amazon Athena | $0.10 | 0.1% |
 | Secrets Manager | $0.28 | 0.3% |
-| **Tổng CDO-02 platform** | **~$87.20** | **100%** |
+| **Tổng CDO-02 platform** | **~$92.00** | **100%** |
 
 > **Không bao gồm**: AI inference cost (Bedrock) - thuộc budget AI team, capped $50/tenant/ngày theo AI contract.
 

@@ -84,17 +84,30 @@ Caption: CDO executor là điểm điều phối chính. AI chỉ đưa ra decis
 ```text
 1. Alert source hoặc scenario injector tạo incident.
 2. Telemetry collector/preprocessor gom metrics/logs/traces theo telemetry contract.
-3. Với RE2/RE3 Offline Simulation Mode, preprocessor đọc `metrics.csv`, `logs.csv`, `traces.csv`, inject `tenant_id`, chuẩn hóa signal rồi đưa vào executor. SQS chỉ dùng như buffer nội bộ nếu CDO chọn.
-4. CDO executor gọi AI /v1/detect.
-5. Nếu AI phát hiện anomaly, executor gọi /v1/decide.
-6. AI trả action_plan[].
-7. Safety gate validate tenant, namespace, `allowed_namespaces`, blast-radius, local rollback/runbook path, `verify_policy`.
-8. Nếu pass, executor chạy dry-run hoặc mock execute theo Offline Simulation Mode.
-9. Executor ghi nhận action result.
+3. Telemetry enqueue vào SQS (CDO-internal buffer). CDO worker dequeue theo rate limit (≤100 RPS/tenant cho /v1/detect).
+   Với RE2/RE3 Offline Simulation Mode: preprocessor đọc CSV → enqueue SQS → worker forward sang AI.
+4. CDO executor gọi AI /v1/detect với telemetry payload.
+5. Nếu AI trả anomaly_detected=true và confidence >= 0.8, executor gọi /v1/decide.
+   Nếu confidence < 0.8 → escalate + audit, không gọi /v1/decide.
+6. AI trả action_plan[], pattern_type, blast_radius_config, verify_policy, cost_cap_exceeded.
+7. Safety gate validate: tenant_id, namespace, allowed_namespaces, blast-radius, rollback plan, verify_policy, idempotency key, action allow-list.
+8a. [URGENT PATH] Nếu pattern_type = "urgent":
+    - CDO executor gọi Kubernetes API trực tiếp (RESTART_DEPLOYMENT, PATCH_MEMORY_LIMIT, ROLLOUT_UNDO)
+    - Chạy server-side dry-run trước, nếu pass thì execute thật
+    - RTO target < 60 giây
+8b. [DEFERRED PATH] Nếu pattern_type = "deferred":
+    - CDO executor KHÔNG gọi Kubernetes API
+    - Executor tạo Git commit cập nhật manifest (ROTATE_SECRET, SCALE_REPLICAS)
+    - ArgoCD phát hiện commit → sync vào cluster (~30-60s)
+    - Executor poll ArgoCD status chờ Synced + Healthy
+9. Executor ghi nhận action result (K8s response hoặc ArgoCD sync status).
 10. Executor thu post-action telemetry hoặc đọc post_telemetry_window từ dataset.
-11. Executor gọi AI /v1/verify.
-12. Nếu success, close incident và ghi audit.
-13. Nếu regression/fail, rollback hoặc escalate với context bundle.
+11. Executor gọi AI /v1/verify với post_telemetry_window.
+12. Nếu success → close incident, ghi audit.
+13. Nếu regression/fail:
+    - Urgent path: kubectl rollout undo hoặc revert patch
+    - Deferred path: tạo revert commit → ArgoCD sync về trạng thái cũ
+    - Nếu rollback không an toàn → escalate với context bundle
 ```
 
 ## 6. AI Contract Integration
@@ -223,7 +236,7 @@ Safety gate bắt buộc kiểm tra:
 | Rollback plan | Bắt buộc có với action mutate |
 | Verify plan | Bắt buộc có metric/log để verify sau action |
 | Idempotency | Không execute trùng cùng `Idempotency-Key`; ưu tiên DynamoDB conditional write |
-| AI confidence | Ngưỡng execute cần chốt với AI |
+| AI confidence | `confidence >= 0.8` → execute; `< 0.8` → escalate + audit, không execute |
 | `pattern_type` routing | `"urgent"` → execute trực tiếp K8s sau safety pass; `"deferred"` → bắt buộc Git commit/PR path |
 | `cost_cap_exceeded` | Nếu `true`: log + notify team, vẫn execute nhưng không escalate cost thêm |
 | Failure fallback | AI 503/timeout -> escalate + audit, không execute mặc định |
@@ -335,7 +348,7 @@ Mục tiêu T6 W11 là có skeleton/base IaC rõ ràng và commit evidence. Mứ
 
 - Cần trainer confirm T6 yêu cầu infra chạy thật tới mức nào.
 - Offline Simulation Mode đã là Mock Mode theo contract AI; cần trainer confirm có cần bổ sung action thật trên sandbox không.
-- Cần chốt confidence threshold để CDO được execute action.
+- ✅ Confidence threshold: CDO-02 dùng `>= 0.8` để execute; `< 0.8` → escalate + audit.
 - ✅ `pattern_type: "deferred"` dùng ArgoCD — đã chốt trong `04_deployment_design.md` Section 3: ArgoCD cài namespace `argocd`, AppProject per tenant, executor tạo Git commit → ArgoCD sync → CDO verify qua `/v1/verify`.
 
 ## Tài Liệu Liên Quan

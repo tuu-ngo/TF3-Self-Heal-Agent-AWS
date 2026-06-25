@@ -72,13 +72,15 @@ Nếu có SLO miss sau khi chạy test, điền bảng này để giải thích 
 
 ### 5.1 Known Pattern Scenarios
 
+> **Ghi chú**: TC-01 đến TC-04 và TC-06 là **build-real** — bắt buộc chạy và tính vào auto-resolve rate. TC-05 là **design-only** — implement nếu kịp W12, không tính vào 60% baseline nếu chưa implement.
+
 | ID | Scenario | Tenant | Signal source | Expected AI decision | Expected CDO action | Expected result |
 |---|---|---|---|---|---|---|
 | TC-01 | Service stuck / latency spike | `tenant-a` | `service_latency_p95` | `service_stuck` | `RESTART_DEPLOYMENT` sau khi safety pass | Auto-resolved |
 | TC-02 | Service stuck / latency spike | `tenant-b` | `service_latency_p95` | `service_stuck` | `RESTART_DEPLOYMENT` sau khi safety pass | Auto-resolved |
 | TC-03 | Error rate spike | `tenant-a` | `service_error_rate`, app logs | `error_rate_spike` | Restart nếu confidence/safety pass, nếu không thì escalate | Auto-resolved hoặc escalated safely |
 | TC-04 | Memory pressure / OOM prevention | `tenant-a` | `container_resource_usage` | `memory_pressure` | `PATCH_MEMORY_LIMIT` chỉ khi có verify_policy và local rollback/runbook path | Auto-resolved hoặc denied safely |
-| TC-05 | Queue/backpressure | `tenant-b` | queue depth hoặc synthetic backlog metric | `queue_backlog` | `SCALE_REPLICAS` trong giới hạn blast-radius | Auto-resolved |
+| TC-05 | Queue/backpressure ⚠️ *design-only* | `tenant-b` | queue depth hoặc synthetic backlog metric | `queue_backlog` | `SCALE_REPLICAS` trong giới hạn blast-radius — **chỉ chạy nếu kịp W12, không tính vào auto-resolve rate baseline** | Auto-resolved (nếu implement) |
 | TC-06 | Secret/cert expiry | `tenant-a` | `secret_expiry_warning` | `secret_expiry` | `ROTATE_SECRET` via deferred GitOps path (safety gate: allow-list + verify_policy bắt buộc) | Auto-resolved via ArgoCD sync |
 
 ### 5.2 Safety And Failure Scenarios
