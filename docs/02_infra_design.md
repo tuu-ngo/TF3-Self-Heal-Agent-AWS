@@ -72,7 +72,8 @@ Caption: CDO executor là điểm điều phối chính. AI chỉ đưa ra decis
 | Telemetry Collector | CloudWatch/Container Insights/Prometheus/OpenTelemetry | Thu logs, metrics, traces theo contract AI | CDO chuẩn hóa data trước khi gọi AI |
 | Optional Telemetry Buffer | Amazon SQS (CDO internal buffer) | Buffer telemetry đã chuẩn hóa từ RE2/RE3 preprocessor hoặc runtime collector trước khi forward sang AI `/v1/detect` | CDO owns; telemetry contract xác nhận SQS là CDO-internal, AI không pull từ SQS |
 | AI Engine | OCI container image do AI bàn giao, CDO tự host in-cluster trên EKS | Decision service do AI team build, CDO deploy/runtime-own | Contract mới nhất chốt namespace `self-heal-system`, service nội bộ cluster và mô hình self-hosted |
-| Safety Gate | Module trong executor | Validate tenant, namespace, confidence threshold, action allow-list, `allowed_namespaces`, blast-radius, `verify_policy` | Chặn unsafe action |
+| Safety Gate | Module trong executor | Validate tenant, namespace, confidence threshold, action allow-list, `allowed_namespaces`, blast-radius, `verify_policy` | Chặn unsafe action (app-level) |
+| Kyverno Admission | K8s Admission Webhook (namespace `kyverno`) | Enforce value-level constraints: replicas ≤ 10, memory ≤ 4Gi, namespace allowlist | Lớp 3 độc lập với executor code |
 | Idempotency Lock | DynamoDB conditional write | Chống execute trùng cùng `Idempotency-Key` | Khớp deployment contract AI |
 | Audit Storage | S3 Object Lock | Ghi audit tamper-evident, retention >=90 ngày | Theo contract AI |
 | Logs | CloudWatch Logs | Logs executor, AI request/response, safety decision | Query theo `correlation_id` |
@@ -241,6 +242,162 @@ Safety gate bắt buộc kiểm tra:
 | `cost_cap_exceeded` | Nếu `true`: log + notify team, vẫn execute nhưng không escalate cost thêm |
 | Failure fallback | AI 503/timeout -> escalate + audit, không execute mặc định |
 
+## 8.1 Admission Control Layer — Kyverno
+
+### Vấn đề Safety Gate chưa giải quyết
+
+Safety gate trong Section 8 là **app-level check**: chạy trong process của CDO executor. Có 2 khoảng trống mà safety gate không bịt được:
+
+1. **Executor code bug → safety gate bypass**: Nếu executor có lỗi, request vẫn đến Kubernetes API và được execute mà không có gì chặn ở cluster level.
+2. **RBAC giới hạn verb, không giới hạn value**: RBAC cho phép executor `patch` Deployment, nhưng không ngăn được `replicas: 1000` hay `memory: 100Gi` — Kubernetes sẽ accept bất kỳ value nào trong phạm vi verb được phép.
+
+### Giải pháp: Kyverno Admission Webhook (Lớp 3)
+
+Kyverno chạy như một **Kubernetes Admission Webhook**, được API Server gọi trước khi persist bất kỳ resource nào vào etcd. Đây là lớp thứ 3 hoàn toàn độc lập với executor code:
+
+```text
+CDO Executor Code
+      ↓
+[Lớp 1] Safety Gate (app-level: tenant, blast-radius, confidence, idempotency)
+      ↓
+Kubernetes API Server
+      ↓
+[Lớp 2] RBAC (verb-level: "được làm action này không?")
+      ↓
+[Lớp 3] Kyverno Admission Webhook (value-level: "giá trị có an toàn không?")
+      ↓
+etcd (resource được persist)
+```
+
+Kyverno kiểm tra **value** của request. Ngay cả khi executor code bị bypass hoặc bug, Kyverno vẫn enforce policy độc lập ở cluster level.
+
+### Cài đặt
+
+Kyverno được cài qua Helm vào namespace `kyverno`:
+
+```bash
+helm repo add kyverno https://kyverno.github.io/kyverno/
+helm install kyverno kyverno/kyverno \
+  --namespace kyverno \
+  --create-namespace \
+  --set admissionController.replicas=1
+```
+
+### ClusterPolicy — 3 policy chính
+
+#### Policy 1: Giới hạn replicas tối đa
+
+Trực tiếp xử lý khoảng trống RBAC trainer chỉ ra: `scale --replicas=1000` sẽ bị chặn ở đây dù RBAC cho phép verb `patch`.
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-replicas-tenant-namespaces
+  annotations:
+    policies.kyverno.io/description: >
+      Chặn SCALE_REPLICAS vượt sandbox cap. RBAC không kiểm soát được value —
+      Kyverno là lớp enforce duy nhất cho giới hạn này.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+  - name: max-replicas-10
+    match:
+      any:
+      - resources:
+          kinds: ["Deployment"]
+          namespaces: ["tenant-a", "tenant-b"]
+    validate:
+      message: >
+        Replicas không được vượt quá 10 trong sandbox CDO-02.
+        Giá trị yêu cầu: {{ request.object.spec.replicas }}.
+        Nếu cần scale hơn, phải qua approval thủ công.
+      pattern:
+        spec:
+          replicas: "<=10"
+```
+
+#### Policy 2: Giới hạn memory limit tối đa
+
+Chặn `PATCH_MEMORY_LIMIT` set memory vượt ceiling sandbox — bảo vệ node không bị starve bởi 1 container.
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-memory-limit-tenant-namespaces
+  annotations:
+    policies.kyverno.io/description: >
+      Chặn PATCH_MEMORY_LIMIT vượt 4Gi per container trong tenant namespaces.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+  - name: max-memory-limit-4gi
+    match:
+      any:
+      - resources:
+          kinds: ["Deployment"]
+          namespaces: ["tenant-a", "tenant-b"]
+    validate:
+      message: "Memory limit per container không được vượt 4Gi trong sandbox CDO-02."
+      foreach:
+      - list: "request.object.spec.template.spec.containers[]"
+        deny:
+          conditions:
+            any:
+            - key: "{{ element.resources.limits.memory || '0' }}"
+              operator: GreaterThan
+              value: "4Gi"
+```
+
+#### Policy 3: Namespace allowlist cho workload mutation
+
+Ngăn CDO executor (hoặc bất kỳ actor nào) mutate Deployment ngoài tenant namespace được phép — defense-in-depth cho cross-tenant attack.
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-workload-mutation-namespace
+  annotations:
+    policies.kyverno.io/description: >
+      Deny Deployment CREATE/UPDATE trong bất kỳ namespace nào ngoài allowlist.
+      Allowlist: tenant-a, tenant-b, kyverno, argocd, self-heal-system, platform, kube-system.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+  - name: allowed-namespaces-only
+    match:
+      any:
+      - resources:
+          kinds: ["Deployment"]
+          operations: ["CREATE", "UPDATE"]
+    exclude:
+      any:
+      - resources:
+          namespaces: ["tenant-a", "tenant-b", "kyverno", "argocd", "self-heal-system", "platform", "kube-system"]
+    validate:
+      message: >
+        Namespace '{{ request.namespace }}' không nằm trong allowlist.
+        Deployment mutation chỉ được phép trong: tenant-a, tenant-b, kyverno, argocd, self-heal-system, platform, kube-system.
+      deny: {}
+```
+
+### Bảng tổng hợp 3 lớp bảo vệ
+
+| Lớp | Cơ chế | Kiểm soát | Điểm yếu còn lại |
+|---|---|---|---|
+| 1. Safety Gate (code) | App-level check trong executor | Tenant match, blast-radius, confidence, idempotency, pattern_type routing | Bypass nếu executor có bug |
+| 2. Kubernetes RBAC | K8s API authorization | "Verb nào được phép trên resource nào" | Không kiểm soát value của request |
+| 3. Kyverno Admission | K8s Admission Webhook | "Value có hợp lệ không" (replicas, memory, namespace) | Chỉ enforce policy đã khai báo |
+
+Với 3 lớp này, "Zero unsafe action" không còn phụ thuộc đơn lẻ vào executor code — Kyverno enforce độc lập ở cluster level trước khi bất kỳ thay đổi nào được persist vào etcd.
+
+---
+
 ## 9. Observability Design
 
 Observability là phần giúp AI và CDO hiểu chuyện gì đang xảy ra trong hệ thống. Với TF3, CDO ưu tiên thu thập 3 loại dữ liệu:
@@ -340,6 +497,11 @@ manifests/
   workloads/
     tenant-a-sample-app.yaml
     tenant-b-sample-app.yaml
+  kyverno/
+    policies/
+      restrict-replicas.yaml          # Policy 1: replicas <= 10
+      restrict-memory-limit.yaml      # Policy 2: memory limit <= 4Gi
+      restrict-executor-namespace.yaml # Policy 3: namespace allowlist
 ```
 
 Mục tiêu T6 W11 là có skeleton/base IaC rõ ràng và commit evidence. Mức chạy thật của VPC/EKS/observability cần xác nhận với trainer nếu AWS account hoặc quota chưa sẵn sàng.
@@ -382,7 +544,7 @@ Evidence môi trường thật hiện tại:
 - AWS account `938145531618` can describe EKS cluster `cdo-eks-cluster-dev`.
 - Cluster is ACTIVE, Kubernetes version `1.30`, region `us-east-1`.
 - Kubeconfig was updated for the EKS context.
-- CDO temporarily enabled public endpoint access for the workstation IP only: `14.224.236.94/32`.
+- CDO temporarily enabled public endpoint access for the workstation IP only: `<WORKSTATION_IP>/32` (removed after W11).
 - Managed node group `cdo-default-ng` is ACTIVE with one `t3.medium` node.
 - Namespace `tenant-a`, `tenant-b`, and `platform` were applied successfully.
 - Public app `podinfo` is running on EKS as `deployment/cdo-sample-api` in namespace `tenant-a`.

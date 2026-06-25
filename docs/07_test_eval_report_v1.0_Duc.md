@@ -72,7 +72,7 @@ Nếu có SLO miss sau khi chạy test, điền bảng này để giải thích 
 
 ### 5.1 Known Pattern Scenarios
 
-> **Ghi chú**: TC-01 đến TC-04 và TC-06 là **build-real** — bắt buộc chạy và tính vào auto-resolve rate. TC-05 là **design-only** — implement nếu kịp W12, không tính vào 60% baseline nếu chưa implement.
+> **Ghi chú**: TC-01 đến TC-06 là **build-real** — bắt buộc chạy và tính vào auto-resolve rate. TC-05 dùng synthetic signal injection (không cần real queue infrastructure) — xem TC-05 detailed section.
 
 | ID | Scenario | Tenant | Signal source | Expected AI decision | Expected CDO action | Expected result |
 |---|---|---|---|---|---|---|
@@ -80,7 +80,7 @@ Nếu có SLO miss sau khi chạy test, điền bảng này để giải thích 
 | TC-02 | Service stuck / latency spike | `tenant-b` | `service_latency_p95` | `service_stuck` | `RESTART_DEPLOYMENT` sau khi safety pass | Auto-resolved |
 | TC-03 | Error rate spike | `tenant-a` | `service_error_rate`, app logs | `error_rate_spike` | Restart nếu confidence/safety pass, nếu không thì escalate | Auto-resolved hoặc escalated safely |
 | TC-04 | Memory pressure / OOM prevention | `tenant-a` | `container_resource_usage` | `memory_pressure` | `PATCH_MEMORY_LIMIT` chỉ khi có verify_policy và local rollback/runbook path | Auto-resolved hoặc denied safely |
-| TC-05 | Queue/backpressure ⚠️ *design-only* | `tenant-b` | queue depth hoặc synthetic backlog metric | `queue_backlog` | `SCALE_REPLICAS` trong giới hạn blast-radius — **chỉ chạy nếu kịp W12, không tính vào auto-resolve rate baseline** | Auto-resolved (nếu implement) |
+| TC-05 | Queue/backpressure | `tenant-b` | Synthetic inject script (`signal_name: queue_backlog, value: 15000`) | `queue_backlog` | `SCALE_REPLICAS` via deferred GitOps path (Git commit → ArgoCD sync) trong giới hạn blast-radius | Auto-resolved via ArgoCD sync |
 | TC-06 | Secret/cert expiry | `tenant-a` | `secret_expiry_warning` | `secret_expiry` | `ROTATE_SECRET` via deferred GitOps path (safety gate: allow-list + verify_policy bắt buộc) | Auto-resolved via ArgoCD sync |
 
 ### 5.2 Safety And Failure Scenarios
@@ -125,6 +125,55 @@ Nếu có SLO miss sau khi chạy test, điền bảng này để giải thích 
 9. CDO ghi full audit trail.
 
 **Expected result:** Incident được close dưới trạng thái auto-resolved. Audit có `safety_passed`, `dry_run_done`, `execute_done`, `verify_done`, `incident_closed`.
+
+### TC-05 - Queue Backpressure Scale-Out
+
+**Goal:** Chứng minh CDO có thể auto-scale workload khi queue backlog cao, qua deferred GitOps path — không direct mutate K8s API.
+
+**Approach:** Synthetic signal injection — inject telemetry payload với `signal_name: "queue_backlog"` và `value: 15000` để trigger AI decision mà không cần real queue infrastructure.
+
+**Preconditions:**
+
+- Namespace `tenant-b` đã tồn tại với deployment `notification-service`.
+- Target deployment có label `tenant_id=tenant-b`.
+- AI endpoint có thể trả `SCALE_REPLICAS` với `pattern_type: "deferred"`.
+- ArgoCD Application của `tenant-b` đang active và CDO có Git write credential cho manifest repo.
+- Current replicas < 10 (Kyverno policy upper bound).
+- Audit sink đang available.
+
+**Steps:**
+
+1. Chạy inject script với payload:
+   ```python
+   # inject_queue_backlog.py
+   payload = {
+     "correlation_id": "tc-05-<uuid>",
+     "idempotency_key": "<uuid>",
+     "dry_run_mode": False,
+     "telemetry_window": [{
+       "ts": "<RFC3339 UTC>",
+       "tenant_id": "6c8b4b2b-4d45-4209-a1b4-4b532d56a31c",
+       "service": "notification-service",
+       "signal_name": "queue_backlog",
+       "value": 15000,
+       "labels": {
+         "system": "E-COMMERCE",
+         "namespace": "tenant-b",
+         "deployment": "notification-service"
+       }
+     }]
+   }
+   # POST tới CDO telemetry ingestion endpoint
+   ```
+2. CDO gọi `/v1/detect` với telemetry payload.
+3. CDO gọi `/v1/decide` — expect AI trả `SCALE_REPLICAS`, `pattern_type: "deferred"`, `verify_policy` có `window_seconds`.
+4. Safety gate validate: tenant match, namespace in allow-list, blast-radius (current replicas + delta <= 10), action in allow-list, idempotency.
+5. CDO **không** gọi K8s API trực tiếp — tạo Git commit cập nhật `replicas` trong `manifests/tenant-b/notification-service/values.yaml`.
+6. ArgoCD detect commit → sync → deployment scales up.
+7. CDO gọi `/v1/verify` với post-action telemetry cho thấy `queue_backlog` giảm.
+8. CDO ghi full audit trail.
+
+**Expected result:** Incident được close dưới trạng thái auto-resolved. Audit có `safety_passed`, `deferred_gitops_path`, Git commit hash, ArgoCD sync event, `verify_done`, `incident_closed`. Không có direct K8s mutation nào từ CDO executor (TC-16 cross-check).
 
 ### TC-07 - Cross-Tenant Action Deny
 

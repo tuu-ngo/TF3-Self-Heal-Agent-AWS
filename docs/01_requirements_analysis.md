@@ -82,11 +82,7 @@ CDO-02 build thật 4 patterns (confirmed với AI contract):
 
 ### 6.2 Patterns design-only
 
-CDO-02 giữ 1 pattern design-only:
-
-| Pattern | Action thiết kế | Lý do design-only |
-|---|---|---|
-| Queue/backpressure | `SCALE_REPLICAS` | Cần dữ liệu `queue_backlog` rõ từ dataset; implement nếu kịp W12 |
+CDO-02 không còn pattern design-only. Queue/backpressure đã được nâng lên build-real (TC-05) từ W12 bằng cách dùng **synthetic signal injection** — inject telemetry payload `queue_backlog: 15000` qua script thay vì cần real queue infrastructure. Full flow: inject → `/v1/detect` → `/v1/decide` (SCALE_REPLICAS deferred) → Git commit → ArgoCD sync → `/v1/verify`.
 
 Danh sách pattern đã confirmed với AI team và khớp với contracts đã ký 2026-06-25.
 
@@ -110,9 +106,9 @@ Các điểm dưới đây cần hỏi trainer/mentor đóng vai client trước
 
 | Chủ đề | Câu hỏi cần hỏi trainer/client | Ảnh hưởng nếu chưa chốt |
 |---|---|---|
-| Sandbox environment | T6/W12 có bắt buộc dùng EKS thật không, hay Kubernetes sandbox/local được chấp nhận nếu có evidence rõ? | Ảnh hưởng infra design và deployment plan |
+| ✅ Sandbox environment | **Resolved W11**: EKS thật bắt buộc — cluster `cdo-eks-cluster-dev` ACTIVE (K8s 1.30, us-east-1). Namespace `platform`, `tenant-a`, `tenant-b` tạo thành công. Evidence: `02_infra_design.md` Section 15. | - |
 | Region | Client/trainer có bắt buộc `us-east-1` theo brief không? | Ảnh hưởng Terraform variables, cost estimate, deployment |
-| Audit storage | Audit có bắt buộc S3 Object Lock không, hay append-only log/DB được chấp nhận cho capstone? | Ảnh hưởng security design và cost |
+| ✅ Audit storage | **Resolved W11**: S3 Object Lock bắt buộc, dùng **Governance Mode** (trainer feedback). Governance cho phép admin với `s3:BypassGovernanceRetention` unlock khi cần trong sandbox; Compliance Mode hoàn toàn không xóa được kể cả admin. | - |
 | Auto-resolved definition | Một incident được tính auto-resolved khi action execute thành công hay khi metrics trở lại normal sau verify? | Ảnh hưởng test report và success criteria |
 | Blast-radius limit | Một lần self-heal được thao tác tối đa bao nhiêu deployment/replica/namespace? | Ảnh hưởng safety gate |
 | Escalation policy | Retry mấy lần trước khi escalate? Escalation message cần format Slack/Markdown/JSON? | Ảnh hưởng workflow và AI response |
@@ -252,7 +248,7 @@ Theo contract AI:
 - Logs: CloudWatch Logs.
 - Metrics: Prometheus endpoint.
 - Traces: OpenTelemetry -> Jaeger hoặc AWS X-Ray.
-- Audit: S3 Object Lock Compliance Mode, retention tối thiểu 90 ngày.
+- Audit: S3 Object Lock Governance Mode, retention tối thiểu 90 ngày.
 
 CDO-02 sẽ đáp ứng bằng cách:
 
@@ -285,7 +281,7 @@ Tất cả các điểm dưới đây đã được xác nhận trong 3 contract
 - Sandbox target là AWS/EKS, nhưng mức bắt buộc chạy thật ở T6 cần trainer xác nhận.
 - Region mặc định theo client brief là `us-east-1`, trừ khi trainer/mentor yêu cầu khác.
 - Observability theo contract AI gồm CloudWatch Logs, Prometheus metrics endpoint và OpenTelemetry traces về Jaeger hoặc AWS X-Ray.
-- Audit storage theo contract AI là S3 Object Lock Compliance Mode, retention tối thiểu 90 ngày.
+- Audit storage theo contract AI là S3 Object Lock Governance Mode, retention tối thiểu 90 ngày.
 - Idempotency lock theo deployment contract AI dùng DynamoDB conditional write; TTL 24 giờ để ngăn replay attack và duplicate execution trong vòng 1 ngày. CDO-02 ưu tiên DynamoDB để khớp AWS-native design.
 - CDO-02 có thể dùng mock/skeleton AI endpoint từ T6 W11 đến trước integration session W12.
 
@@ -296,7 +292,7 @@ Tổng hợp trạng thái các câu hỏi với AI team và trainer/mentor.
 ### 11.1 Đã chốt với AI team (resolved 2026-06-25)
 
 1. ✅ **4 build patterns confirmed**: service stuck/latency spike, error rate spike/code-level fault, memory pressure/OOM, secret/cert expiry.
-2. ✅ **1 design-only**: queue/backpressure (`SCALE_REPLICAS`); implement nếu kịp W12.
+2. ✅ **0 design-only**: queue/backpressure (`SCALE_REPLICAS`) đã nâng lên build-real (TC-05) qua synthetic `queue_backlog` signal injection.
 3. ✅ Signal naming đã chuẩn hóa theo telemetry contract mới (ví dụ: `service_error_rate`, không phải `istio_request_error_rate`).
 4. ✅ **Offline Simulation Mode / Mock Mode** — AI contract đã định nghĩa Mock Mode cho RE2/RE3 (deployment contract section Offline Simulation Mode). Trainer confirm là đủ evidence cho W12 demo.
 5. ✅ **AI skeleton endpoint URL** — endpoint nội bộ: `http://ai-engine.self-heal-system.svc.cluster.local:8080/` (confirmed deployment contract). CDO dùng endpoint này khi deploy AI image vào EKS.
@@ -305,14 +301,14 @@ Tổng hợp trạng thái các câu hỏi với AI team và trainer/mentor.
 
 ### 11.2 Cần xác nhận với trainer/mentor (W12)
 
-1. Trainer có bắt buộc S3 Object Lock cho audit không, hay append-only log được chấp nhận? — CDO-02 giả định S3 Object Lock Compliance Mode (theo deployment contract), sẽ confirm với trainer trước W12.
+1. Trainer có bắt buộc S3 Object Lock cho audit không, hay append-only log được chấp nhận? — CDO-02 dùng S3 Object Lock Governance Mode (confirmed từ trainer feedback W11) — Governance cho phép admin unlock khi cần, Compliance thì không xóa được.
 2. Trainer có yêu cầu region khác `us-east-1` không? — CDO-02 giả định `us-east-1` theo client brief.
 3. Trainer có yêu cầu base infra T6 phải chạy thật hoàn toàn không, hay skeleton + plan + commit evidence được chấp nhận? — CDO-02 target EKS thật; escalate mentor nếu setup bị block.
 
 ## 12. Checklist Hoàn Thành Pack #1
 
 - [x] CDO angle locked. (K8s-heavy, AI boundary: AI decides, CDO executes — locked T3 W11)
-- [x] Build/design-only patterns confirmed with AI. (4 build-real, 1 design-only — confirmed 2026-06-25)
+- [x] Build/design-only patterns confirmed with AI. (5 build-real, 0 design-only — confirmed 2026-06-25)
 - [x] AI contract open questions documented và resolved. (Section 11.1 — tất cả 7 items đã ✅)
 - [x] NFR table reviewed by team. (Section 7)
 - [x] Giả định đã được xác nhận hoặc đánh dấu là rủi ro. (Section 10)

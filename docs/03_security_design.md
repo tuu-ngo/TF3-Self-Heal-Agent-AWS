@@ -245,7 +245,7 @@ Audit record tối thiểu:
 | `reason` | Lý do safety deny hoặc failure |
 | `idempotency_key` | Chống execute trùng action |
 
-Storage target theo contract AI: **S3 Object Lock Compliance Mode**, retention tối thiểu 90 ngày.
+Storage target theo contract AI: **S3 Object Lock Governance Mode**, retention tối thiểu 90 ngày.
 
 ## 9. Data Protection
 

@@ -17,6 +17,7 @@ CDO-02 chọn **Terraform** là công cụ IaC chính cho thiết kế triển k
 
 State backend dự kiến:
 
+- **Terraform version:** >= 1.10 (bắt buộc để dùng `use_lockfile = true` với S3 backend — feature không có ở version cũ hơn)
 - **Remote state:** S3
 - **State lock:** S3 lockfile (`use_lockfile = true`)
 - **State separation:** 1 state chính cho environment `sandbox`

@@ -109,7 +109,7 @@ Executor chạy trong `platform` namespace và chỉ được cấp quyền theo
 
 ### Context
 
-TF3 yêu cầu audit log tamper-evident, retention tối thiểu 90 ngày. AI deployment contract cũng ghi audit target là S3 Object Lock Compliance Mode.
+TF3 yêu cầu audit log tamper-evident, retention tối thiểu 90 ngày. AI deployment contract ghi audit target là S3 Object Lock; CDO-02 dùng **Governance Mode** (confirmed trainer feedback W11) — Governance cho phép admin với quyền `s3:BypassGovernanceRetention` unlock khi cần cho sandbox, trong khi Compliance hoàn toàn không xóa được ngay cả admin.
 
 ### Decision
 
@@ -251,3 +251,56 @@ CDO-02 implement `pattern_type: "deferred"` bằng cách executor tự động t
 
 - Không implement deferred path: đơn giản hơn nhưng vi phạm AI contract.
 - Manual PR workflow: có approval gate nhưng quá chậm cho self-heal automation.
+
+---
+
+## ADR-009 - Chọn Kyverno thay vì Gatekeeper cho Admission Control Layer
+
+- **Status:** Accepted
+- **Date:** 2026-06-25
+
+### Context
+
+Safety gate trong CDO executor là app-level check chạy trong process — nếu executor có bug, request vẫn đến Kubernetes API và được execute. RBAC kiểm soát verb nhưng không kiểm soát value: executor có thể `patch` Deployment với `replicas: 1000` hoặc `memory: 100Gi` mà RBAC không chặn được vì verb `patch` đã được cấp phép.
+
+Cần lớp thứ 3 độc lập ở cluster level: Kubernetes Admission Webhook. API Server gọi webhook trước khi persist bất kỳ resource nào vào etcd, hoàn toàn nằm ngoài executor code path. CDO-02 phải chọn giữa 2 framework: **Kyverno** và **Gatekeeper (OPA)**.
+
+### Decision
+
+CDO-02 chọn **Kyverno** để implement Admission Control Layer với 3 ClusterPolicy:
+
+1. `restrict-replicas-tenant-namespaces` — replicas ≤ 10 trong tenant-a, tenant-b
+2. `restrict-memory-limit-tenant-namespaces` — memory limit ≤ 4Gi per container
+3. `restrict-workload-mutation-namespace` — Deployment mutation chỉ trong namespace allowlist
+
+### Why Kyverno
+
+- **YAML-native policy**: Policy viết bằng Kubernetes YAML chuẩn. Team đã quen với YAML, không phải học ngôn ngữ riêng. Tốc độ viết và review nhanh hơn đáng kể.
+- **Single-file per policy**: Mỗi rule là 1 `ClusterPolicy` CRD — deploy, edit, debug bằng `kubectl` như resource Kubernetes bình thường. Không có abstraction layer thêm.
+- **Authoring speed**: 3 policy Kyverno tốn ~30 phút viết và test trong W12. Ưu tiên trong context 6 ngày build.
+- **`validationFailureAction: Enforce`**: Block ngay tại admission, không phải audit-only — phù hợp với hard requirement "Zero unsafe action".
+- **`background: false`**: Chỉ kiểm tra request mới, không scan existing resources liên tục — giảm noise trong demo environment.
+- **Lightweight**: `admissionController.replicas=1` đủ cho sandbox. Không cần HA setup.
+
+### Why NOT Gatekeeper (OPA)
+
+- **Rego language**: Gatekeeper yêu cầu viết policy bằng Rego — functional language với cú pháp và tư duy hoàn toàn khác YAML/Go. CDO-02 không có Rego experience; learning curve không khả thi trong W12.
+- **2-file structure**: Mỗi policy cần `ConstraintTemplate` (chứa Rego logic) + `Constraint` (instantiate). 3 policy = 6 files, gấp đôi so với Kyverno. ConstraintTemplate cũng yêu cầu hiểu CRD schema.
+- **Verbose ConstraintTemplate**: Phần Rego không self-documenting — khó đọc lại trong buổi chấm khi panel hỏi "policy này làm gì".
+- **OPA audit controller**: Gatekeeper chạy audit background scan định kỳ, có thể tạo confusion khi policy enforce chưa nhất quán ngay sau deploy.
+- **Heavier default footprint**: Gatekeeper deploy nhiều component hơn (controller-manager, audit, webhook). Tốn node resource hơn Kyverno single-replica cho cùng mức coverage trong sandbox.
+
+### Consequences
+
+- **Pro:** 3 lớp bảo vệ độc lập — Safety Gate (app-level) → RBAC (verb-level) → Kyverno (value-level). "Zero unsafe action" không còn phụ thuộc đơn lẻ vào executor code path.
+- **Pro:** Policy as code — commit vào Git cùng manifests, version-controlled, reviewable.
+- **Pro:** Block tại API Server trước etcd — không bypass được kể cả khi executor có bug.
+- **Trade-off:** 3 policy hiện tại chỉ cover `Deployment` resource. Nếu cần enforce trên `StatefulSet` hay `DaemonSet`, phải extend `kinds` list trong mỗi policy.
+- **Trade-off:** `admissionController.replicas=1` không có HA — nếu Kyverno pod crash trong quá trình test, webhook fail-open (request đi qua không bị chặn). Chấp nhận cho sandbox scope.
+- **Trade-off:** Policy misconfiguration (ví dụ block nhầm namespace hệ thống) có thể làm ArgoCD hoặc executor không deploy được. Cần test policy trên dry-run trước khi set `Enforce`.
+
+### Alternatives considered
+
+- **OPA Gatekeeper**: Admission webhook mạnh hơn, có audit controller và separation giữa policy schema và logic. Nhưng Rego learning curve quá cao cho W12 timeline. Rejected.
+- **Custom ValidatingWebhookConfiguration**: Linh hoạt nhất nhưng phải viết webhook server, TLS cert, registration từ đầu. Không hợp lý cho scope 6 ngày. Rejected.
+- **Chỉ dùng Safety Gate + RBAC (không có Layer 3)**: Đủ cho happy path demo nhưng không bịt được gap executor bug bypass và RBAC value blindness. Rejected — vi phạm trainer feedback về "Zero unsafe action" tại cluster level.

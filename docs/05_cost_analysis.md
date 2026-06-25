@@ -61,7 +61,7 @@ Scope cost CDO-02 bao gồm: VPC/networking, EKS cluster, observability stack, a
 | S3 PUT requests (audit writes) | ~10,000 objects/ngày | $0.005/1,000 | $0.05 | **$0.50** |
 | S3 GET requests (Athena query) | ~1,000 queries | $0.0004/1,000 | $0.001 | **$0.01** |
 | S3 Terraform remote state | ~1 MB | negligible | - | **< $0.01** |
-| S3 Object Lock storage overhead | WORM compliance mode | included in storage | - | - |
+| S3 Object Lock storage overhead | WORM governance mode | included in storage | - | - |
 | **Subtotal S3** | | | **~$0.06/ngày** | **~$0.55** |
 
 ### 3.4 Amazon DynamoDB - Idempotency Lock
@@ -197,12 +197,12 @@ Nếu scale từ sandbox lên production thật với 2 tenant chạy liên tụ
 | Thành phần | Forecast (W11) | Actual (W12) | Delta |
 |---|---:|---:|---:|
 | EKS cluster + nodes | $50.00 | TBD | TBD |
-| VPC & Networking | $20.35 | TBD | TBD |
+| VPC & Networking | $25.15 | TBD | TBD |
 | CloudWatch | $15.53 | TBD | TBD |
 | S3 + Athena | $0.65 | TBD | TBD |
 | DynamoDB + SQS | $0.10 | TBD | TBD |
 | ECR + Secrets Manager | $0.57 | TBD | TBD |
-| **Total** | **~$87.20** | **TBD** | **TBD** |
+| **Total** | **~$92.00** | **TBD** | **TBD** |
 
 > Cột Actual sẽ được điền từ AWS Cost Explorer sau khi chạy full simulation W12. Tag tất cả resources với `Project=tf3-cdo-02` để filter cost chính xác.
 
