@@ -89,7 +89,7 @@ Caption: CDO executor là điểm điều phối chính. AI chỉ đưa ra decis
 4. CDO executor gọi AI /v1/detect với telemetry payload.
 5. Nếu AI trả anomaly_detected=true và confidence >= 0.8, executor gọi /v1/decide.
    Nếu confidence < 0.8 → escalate + audit, không gọi /v1/decide.
-6. AI trả action_plan[], pattern_type, blast_radius_config, verify_policy, cost_cap_exceeded.
+6. AI trả matched_runbook, action_plan[], pattern_type, blast_radius_config, verify_policy, cost_cap_exceeded.
 7. Safety gate validate: tenant_id, namespace, allowed_namespaces, blast-radius, rollback plan, verify_policy, idempotency key, action allow-list.
 8a. [URGENT PATH] Nếu pattern_type = "urgent":
     - CDO executor gọi Kubernetes API trực tiếp (RESTART_DEPLOYMENT, PATCH_MEMORY_LIMIT, ROLLOUT_UNDO)
@@ -117,8 +117,8 @@ CDO-02 consume AI API Contract như sau:
 | API | CDO usage |
 |---|---|
 | `POST /v1/detect` | Gửi telemetry/context để AI xác định anomaly. Bắt buộc: `Idempotency-Key`, `X-Dry-Run-Mode` |
-| `POST /v1/decide` | Nhận `pattern_type`, `action_plan[]`, `blast_radius_config`, `verify_policy`, `cost_cap_exceeded` |
-| `POST /v1/verify` | Gửi post-action metrics để AI xác định success/regression. Bắt buộc: `Idempotency-Key`, `X-Dry-Run-Mode` |
+| `POST /v1/decide` | Nhận `matched_runbook`, `pattern_type`, `action_plan[]`, `blast_radius_config`, `verify_policy`, `cost_cap_exceeded` |
+| `POST /v1/verify` | Gửi `correlation_id`, `idempotency_key`, `dry_run_mode`, `action_executed`, `post_telemetry_window`. Nhận `success`, `regression_detected`, `next_action` (DONE/RETRY/ROLLBACK/ESCALATE) |
 
 Headers/auth theo contract:
 

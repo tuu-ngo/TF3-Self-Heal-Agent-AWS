@@ -191,7 +191,7 @@ Luồng tích hợp:
 /v1/detect -> AI trả anomaly_detected, severity, anomaly_context, confidence, reasoning, correlation_id
 /v1/decide -> AI trả matched_runbook, pattern_type, action_plan[], blast_radius_config, verify_policy, cost_cap_exceeded
 CDO execute/mock execute action (theo pattern_type: urgent = direct K8s; deferred = Git commit/PR)
-/v1/verify -> CDO gửi idempotency_key, dry_run_mode, action_executed + post_telemetry_window; AI trả success, regression_detected, next_action, escalation_bundle nếu cần
+/v1/verify -> CDO gửi correlation_id, idempotency_key, dry_run_mode, action_executed + post_telemetry_window; AI trả success, regression_detected, next_action (enum: "DONE"|"RETRY"|"ROLLBACK"|"ESCALATE"), escalation_bundle nếu cần
 ```
 
 Các action AI contract định nghĩa (enum cố định):
