@@ -10,6 +10,8 @@ CDO-02 thiết kế platform để Self-Heal Engine chạy an toàn trên Kubern
 
 Angle của CDO-02 là **K8s-heavy / Kubernetes Workflow Orchestration**. Trọng tâm không phải chỉ deploy AI, mà là xây lớp orchestration kiểm soát mọi hành động tự chữa lỗi trên Kubernetes.
 
+![architect](image.png)
+
 ## 2. Đọc nhanh: hệ thống này chạy như thế nào?
 
 Nói ngắn gọn, CDO-02 xây một "người điều phối" nằm giữa alert, AI và Kubernetes:
