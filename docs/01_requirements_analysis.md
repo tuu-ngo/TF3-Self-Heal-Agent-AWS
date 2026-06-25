@@ -56,7 +56,7 @@ CDO-02 không làm các phần sau trong scope capstone:
 - Không làm real PagerDuty/OpsGenie; Slack/mock pager là đủ.
 - Không làm hash-chain crypto audit; S3 Object Lock hoặc append-only audit là đủ.
 - Không làm cross-region replication.
-- Không làm mTLS; bearer token/JWT là đủ cho capstone.
+- Không làm mTLS giữa các CDO components nội bộ; IAM SigV4 là auth bắt buộc cho mọi AI API call (confirmed contract).
 
 ## 5. Hướng Khác Biệt Của CDO-02
 

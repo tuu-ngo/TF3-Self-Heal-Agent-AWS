@@ -142,42 +142,147 @@ Smoke test là phần bắt buộc vì Self-Heal Engine không chỉ cần deplo
 
 ## 3. GitOps
 
-### 3.1 Công cụ
+### 3.1 Công cụ và lý do chọn ArgoCD
 
-CDO-02 đề xuất **ArgoCD** là công cụ GitOps ưu tiên cho tài nguyên trong cluster. Lý do:
+CDO-02 chọn **ArgoCD** là công cụ GitOps bắt buộc. Lý do:
 
 - Phù hợp với workload Kubernetes-centric.
-- Giúp tách rõ boundary:
-  - **Terraform** provision AWS base infra
-  - **ArgoCD** sync Kubernetes manifests và Helm releases
-- Có khả năng quan sát drift và rollback theo Git revision.
-- **Bắt buộc** cho `pattern_type: "deferred"` từ AI contract: khi AI trả deferred action plan, CDO tạo Git commit/PR và ArgoCD sync về cluster. Không direct mutate Kubernetes trong path này.
+- Tách rõ boundary: **Terraform** provision AWS base infra; **ArgoCD** sync Kubernetes manifests và Helm releases.
+- Có drift detection, rollback theo Git revision và audit trail rõ.
+- **Bắt buộc** cho `pattern_type: "deferred"` theo AI contract: khi AI trả deferred action plan, CDO executor tạo Git commit/PR để ArgoCD tự động sync về cluster. CDO không được direct mutate Kubernetes trong path này.
 
-Ghi chú trạng thái hiện tại:
+### 3.2 Cài đặt ArgoCD
 
-- ArgoCD là hướng cần có nếu CDO muốn chứng minh nhánh `deferred`.
-- Repo hiện mới chứng minh runtime path cho nhánh `urgent` bằng `kubectl rollout restart`.
-- Vì vậy, phần GitOps trong tài liệu này đang ở mức target design, chưa phải bằng chứng runtime đã hoàn thành.
+ArgoCD được cài vào cluster EKS theo quy trình:
 
-### 3.2 Cấu trúc repo / sync
+```text
+Namespace:     argocd
+Cài bằng:      Helm chart (argo/argo-cd) hoặc manifest chính thức
+Quản lý bởi:   Terraform module argocd/ hoặc bootstrap script
+```
 
-Hướng chia deployment responsibility:
+Các thành phần chính sau cài đặt:
 
-- Terraform:
-  - VPC
-  - EKS
-  - IAM/IRSA
-  - S3 audit bucket
-- ArgoCD:
-  - Namespaces
-  - RBAC
-  - kube-prometheus-stack
-  - executor/collector manifests
-  - sample workloads cho tenant demo
+| Component | Mô tả |
+|---|---|
+| `argocd-server` | UI + API server, internal-only (không public) |
+| `argocd-repo-server` | Render manifest từ Git repo |
+| `argocd-application-controller` | Reconcile cluster state so với Git |
+| `argocd-dex-server` | SSO (optional trong capstone) |
 
-### 3.3 Sync waves
+ArgoCD không expose public endpoint. CDO team truy cập qua `kubectl port-forward` hoặc Internal Load Balancer trong VPC.
 
-Thứ tự sync đề xuất:
+### 3.3 AppProject — tenant isolation
+
+CDO-02 dùng **ArgoCD AppProject** để enforce multi-tenant isolation ở tầng GitOps. Mỗi tenant có AppProject riêng:
+
+```yaml
+# AppProject tenant-a
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: tenant-a
+  namespace: argocd
+spec:
+  description: "Self-heal workloads for tenant-a"
+  sourceRepos:
+    - "https://github.com/<org>/tf3-self-heal-manifests"
+  destinations:
+    - namespace: tenant-a
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist: []       # không cho phép cluster-wide resource
+  namespaceResourceWhitelist:
+    - group: "apps"
+      kind: Deployment
+    - group: ""
+      kind: ConfigMap
+```
+
+Tương tự cho `tenant-b`. AppProject bảo đảm Application của tenant-a không thể sync resource vào namespace `tenant-b` hoặc `platform`.
+
+### 3.4 ArgoCD Application
+
+Mỗi tenant có một ArgoCD Application trỏ vào thư mục manifest tương ứng trong Git:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: self-heal-tenant-a
+  namespace: argocd
+spec:
+  project: tenant-a
+  source:
+    repoURL: https://github.com/<org>/tf3-self-heal-manifests
+    targetRevision: main
+    path: manifests/tenant-a/
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: tenant-a
+  syncPolicy:
+    automated:
+      prune: false       # không xóa resource tự động
+      selfHeal: true     # tự sync khi phát hiện drift
+    syncOptions:
+      - CreateNamespace=false
+```
+
+`prune: false` đảm bảo ArgoCD không tự xóa resource khi manifest bị remove — cần approval thủ công cho destructive action.
+
+### 3.5 Luồng deferred path chi tiết
+
+Khi AI trả `pattern_type: "deferred"` (ví dụ: `ROTATE_SECRET`, `SCALE_REPLICAS`):
+
+```text
+1. CDO Executor nhận action_plan từ /v1/decide
+2. Safety gate validate: tenant, namespace, allowed_namespaces, blast-radius, verify_policy
+3. Executor tạo Git commit cập nhật manifest trong tf3-self-heal-manifests/manifests/<tenant>/
+   Ví dụ: patch replicas trong deployment.yaml hoặc trigger secret rotation config
+4. Executor tạo PR (nếu require review) hoặc commit thẳng vào main (nếu auto-approve)
+5. ArgoCD phát hiện thay đổi trong ~30-60s (polling interval)
+6. ArgoCD sync Application tương ứng vào namespace tenant
+7. Executor poll ArgoCD Application status qua ArgoCD API hoặc kubectl
+8. Khi sync status = Synced + Health = Healthy → Executor gọi /v1/verify với post_telemetry_window
+9. Ghi audit log: deferred_git_commit, argocd_sync_status, verify_result
+```
+
+Thời gian tổng thể của deferred path: ~2–5 phút (Git commit + ArgoCD polling + sync + verify).
+
+### 3.6 Git repo manifest cho deferred path
+
+CDO-02 dùng repo riêng (hoặc thư mục riêng trong cùng repo) để chứa manifest được quản lý bởi ArgoCD:
+
+```text
+tf3-self-heal-manifests/
+  manifests/
+    tenant-a/
+      deployment-api.yaml
+      configmap-limits.yaml
+    tenant-b/
+      deployment-worker.yaml
+  argocd/
+    appproject-tenant-a.yaml
+    appproject-tenant-b.yaml
+    application-tenant-a.yaml
+    application-tenant-b.yaml
+```
+
+CDO executor chỉ được write vào `manifests/<tenant>/` của chính tenant đó. Quyền write vào repo được cấp qua GitHub App token hoặc deploy key, không dùng personal access token tĩnh.
+
+### 3.7 Cấu trúc repo / sync responsibility
+
+| Layer | Tool | Scope |
+|---|---|---|
+| AWS base infra | Terraform | VPC, EKS, IAM/IRSA, S3, DynamoDB |
+| ArgoCD bootstrap | Terraform hoặc Helm | namespace `argocd`, ArgoCD install |
+| AppProject + Application | ArgoCD | Scoped per tenant |
+| Namespace + RBAC | ArgoCD (wave 0–1) | platform, tenant-a, tenant-b |
+| Observability stack | ArgoCD (wave 2) | Prometheus, Alertmanager, Grafana |
+| CDO executor / collector | ArgoCD (wave 3) | namespace `platform` |
+| Sample workloads | ArgoCD (wave 4) | tenant-a, tenant-b |
+| Runtime deferred action | CDO executor → Git commit → ArgoCD | Per-incident manifest patch |
+
+### 3.8 Sync waves
 
 | Wave | Components |
 |---|---|
@@ -187,13 +292,11 @@ Thứ tự sync đề xuất:
 | 3 | CDO executor, telemetry collector, webhook/mock integration |
 | 4 | Tenant sample workloads và test scenarios |
 
-### 3.4 Drift detection
-
-CDO-02 ưu tiên có drift detection cho phần Kubernetes manifests:
+### 3.9 Drift detection
 
 - ArgoCD phát hiện sai khác giữa Git và cluster.
-- Drift được review trước khi chấp nhận destructive sync.
-- Các thay đổi nhạy cảm như RBAC, namespace, observability routing cần có approval thay vì auto-heal mù quáng.
+- Drift được review trước khi chấp nhận destructive sync (`prune: false`).
+- Thay đổi nhạy cảm như RBAC, namespace, observability routing cần approval thủ công.
 
 ## 4. Chiến lược triển khai
 
@@ -364,7 +467,7 @@ Những điểm dưới đây cần tiếp tục chốt với AI team hoặc tra
 
 - Traces có bắt buộc phải hoạt động đầy đủ trong demo, hay logs + metrics là đủ?
 - Tenant onboarding có cần tự động hóa sâu hơn bằng workflow engine, hay Terraform + GitOps là đủ cho scope hiện tại?
-- AI team có cung cấp environment/stub ổn định để smoke test private endpoint và auth flow không?
+- ✅ AI endpoint đã confirmed: `http://ai-engine.self-heal-system.svc.cluster.local:8080/` — CDO deploy từ OCI image AI bàn giao vào namespace `self-heal-system`.
 
 ## Tài Liệu Liên Quan
 

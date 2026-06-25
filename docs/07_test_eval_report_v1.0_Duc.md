@@ -79,7 +79,7 @@ Nếu có SLO miss sau khi chạy test, điền bảng này để giải thích 
 | TC-03 | Error rate spike | `tenant-a` | `service_error_rate`, app logs | `error_rate_spike` | Restart nếu confidence/safety pass, nếu không thì escalate | Auto-resolved hoặc escalated safely |
 | TC-04 | Memory pressure / OOM prevention | `tenant-a` | `container_resource_usage` | `memory_pressure` | `PATCH_MEMORY_LIMIT` chỉ khi có verify_policy và local rollback/runbook path | Auto-resolved hoặc denied safely |
 | TC-05 | Queue/backpressure | `tenant-b` | queue depth hoặc synthetic backlog metric | `queue_backlog` | `SCALE_REPLICAS` trong giới hạn blast-radius | Auto-resolved |
-| TC-06 | Cert/secret/config issue | `tenant-a` | app logs / synthetic alert | `config_issue` | `ROTATE_SECRET` bị deny nếu chưa được allow rõ | Escalated safely |
+| TC-06 | Secret/cert expiry | `tenant-a` | `secret_expiry_warning` | `secret_expiry` | `ROTATE_SECRET` via deferred GitOps path (safety gate: allow-list + verify_policy bắt buộc) | Auto-resolved via ArgoCD sync |
 
 ### 5.2 Safety And Failure Scenarios
 
@@ -190,7 +190,7 @@ Planned load profile:
 
 - Ramp-up: 0 -> 100 simulated alert/API events mỗi phút trong 5 phút.
 - Sustained: 100 events mỗi phút trong 10 phút.
-- Tenants simulated: namespaces `tenant-a`, `tenant-b`; request header uses CDO-02 tenant UUID `6c8b4b2b-4d45-4209-a1b4-4b532d56a31c` pending AI confirmation.
+- Tenants simulated: namespaces `tenant-a`, `tenant-b`; request header dùng CDO-02 tenant UUID `6c8b4b2b-4d45-4209-a1b4-4b532d56a31c` (confirmed deployment contract 2026-06-25).
 - Tool: k6, Locust hoặc scenario replay runner.
 
 ### 8.2 Results

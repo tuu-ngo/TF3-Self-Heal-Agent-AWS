@@ -38,7 +38,7 @@ CDO-02 chọn angle **K8s-heavy / Kubernetes Workflow Orchestration**. CDO execu
 
 ## ADR-002 - AI là decision service, CDO executor là execution boundary
 
-- **Status:** Accepted, pending AI contract clarification
+- **Status:** Accepted (contracts confirmed 2026-06-25)
 - **Date:** 2026-06-23
 
 ### Context

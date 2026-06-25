@@ -307,12 +307,24 @@ infra/
   modules/
     vpc/
     eks/
+    iam/                   # IRSA, deploy role, least-privilege policies
     observability/
+    audit/                 # S3 Object Lock bucket, retention policy
+    idempotency/           # DynamoDB table idempotency lock
+    tenant-bootstrap/      # namespace, RBAC, labels per tenant
 manifests/
   namespaces/
     tenant-a.yaml
     tenant-b.yaml
     platform.yaml
+  argocd/
+    appproject-tenant-a.yaml
+    appproject-tenant-b.yaml
+    application-tenant-a.yaml
+    application-tenant-b.yaml
+  workloads/
+    tenant-a-sample-app.yaml
+    tenant-b-sample-app.yaml
 ```
 
 Mục tiêu T6 W11 là có skeleton/base IaC rõ ràng và commit evidence. Mức chạy thật của VPC/EKS/observability cần xác nhận với trainer nếu AWS account hoặc quota chưa sẵn sàng.
@@ -322,7 +334,7 @@ Mục tiêu T6 W11 là có skeleton/base IaC rõ ràng và commit evidence. Mứ
 - Cần trainer confirm T6 yêu cầu infra chạy thật tới mức nào.
 - Offline Simulation Mode đã là Mock Mode theo contract AI; cần trainer confirm có cần bổ sung action thật trên sandbox không.
 - Cần chốt confidence threshold để CDO được execute action.
-- `pattern_type: "deferred"` yêu cầu ArgoCD/GitOps path; cần chốt ArgoCD có sẵn trong W12 hay dùng manual PR merge làm bằng chứng.
+- ✅ `pattern_type: "deferred"` dùng ArgoCD — đã chốt trong `04_deployment_design.md` Section 3: ArgoCD cài namespace `argocd`, AppProject per tenant, executor tạo Git commit → ArgoCD sync → CDO verify qua `/v1/verify`.
 
 ## Tài Liệu Liên Quan
 

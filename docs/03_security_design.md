@@ -82,7 +82,7 @@ graph TB
         end
     end
 
-    EXEC -->|HTTPS + IAM SigV4| AI
+    EXEC -->|HTTP + IAM SigV4 header in-cluster| AI
     EXEC -->|Kubernetes API| EKS
     EXEC --> CW
     EXEC --> S3
@@ -91,8 +91,8 @@ graph TB
 
 ### 3.2 Quy Tắc Network
 
-- AI endpoint là internal endpoint, không public Internet.
-- CDO executor gọi AI qua HTTPS và IAM SigV4.
+- AI endpoint là internal endpoint, không public Internet. Transport là HTTP in-cluster (`http://ai-engine.self-heal-system.svc.cluster.local:8080/`); SigV4 signing vẫn bắt buộc dù không có TLS transport.
+- CDO executor gọi AI qua HTTP in-cluster với IAM SigV4 header.
 - Kubernetes API access chỉ dành cho executor ServiceAccount/Role phù hợp.
 - Audit/log traffic đi tới CloudWatch và S3.
 - Nếu cần NAT/VPC endpoints, ưu tiên VPC endpoints cho S3, CloudWatch, Secrets Manager để giảm public exposure.
@@ -129,6 +129,8 @@ CDO-02 dùng namespace-based RBAC:
 | `platform` | Chạy CDO executor, telemetry collector |
 | `tenant-a` | Workload tenant A |
 | `tenant-b` | Workload tenant B |
+| `argocd` | ArgoCD controller, repo-server, application-controller |
+| `self-heal-system` | AI Engine pod (do CDO deploy từ image AI bàn giao) |
 
 RBAC principles:
 
@@ -138,7 +140,7 @@ RBAC principles:
 - Không cấp quyền delete namespace, modify IAM, modify cluster-wide resource.
 - Cross-namespace action phải bị deny bởi safety gate và RBAC.
 
-Ví dụ quyền tối thiểu dự kiến:
+Ví dụ quyền tối thiểu dự kiến cho CDO executor:
 
 ```text
 get/list/watch: pods, deployments, replicasets, events
@@ -146,15 +148,26 @@ patch/update: deployments scale/restart target
 create: events hoặc configmap audit marker nếu cần
 ```
 
+ArgoCD service account cần quyền cluster-level để sync resource vào namespace được chỉ định trong AppProject:
+
+```text
+get/list/watch: namespaces, deployments, configmaps, secrets, serviceaccounts, roles, rolebindings
+create/patch/update: resources trong namespace tenant-a, tenant-b (scoped bởi AppProject)
+KHÔNG cấp: cluster-admin, delete namespace, modify IAM
+```
+
+CDO executor cần quyền write vào Git manifest repo qua **GitHub App token** (không dùng personal access token tĩnh) để tạo commit cho deferred path.
+
 ## 6. Tenant Isolation
 
 Tenant isolation bảo đảm tenant này không bị action nhầm sang tenant khác. Đây là hard requirement của TF3.
 
-Tenant isolation được enforce ở 3 lớp:
+Tenant isolation được enforce ở 4 lớp:
 
 1. **Request layer:** mọi request có `X-Tenant-Id` hoặc `tenant_id`.
 2. **Safety layer:** action target namespace phải khớp tenant.
 3. **Kubernetes layer:** ServiceAccount/RoleBinding chỉ có quyền trong namespace được phép.
+4. **GitOps layer (deferred path):** ArgoCD AppProject scoped per tenant — Application của `tenant-a` chỉ được phép sync vào namespace `tenant-a`; không thể sync sang `tenant-b` hoặc `platform` dù executor tạo commit sai target.
 
 Nếu AI trả action target `tenant-b` cho incident của `tenant-a`, CDO executor phải:
 
@@ -255,7 +268,7 @@ Phần này liệt kê các tình huống nguy hiểm và control tương ứng.
 - ~~Confirm `ROTATE_SECRET` policy cho demo~~: **Resolved** — `ROTATE_SECRET` là build thật. Safety gate enforce: signal `secret_expiry_warning` → target `secret_name` phải trong allow-list → `pattern_type: deferred` → GitOps path, không direct mutate.
 - Trainer có bắt buộc S3 Object Lock thật cho W11/T6 không, hay W12 mới cần evidence?
 - Traces có bắt buộc phải triển khai đầy đủ trong W12 demo không?
-- `pattern_type: "deferred"` yêu cầu ArgoCD/GitOps path; cần chốt ArgoCD có sẵn trong W12 hay manual PR merge làm bằng chứng.
+- ~~`pattern_type: "deferred"` cần chốt ArgoCD~~: **Resolved** — ArgoCD cài trong cluster namespace `argocd`, AppProject per tenant enforce namespace isolation, executor tạo Git commit → ArgoCD auto-sync → CDO verify. Chi tiết tại `04_deployment_design.md` Section 3.
 
 ## Tài Liệu Liên Quan
 
