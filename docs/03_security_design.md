@@ -2,7 +2,7 @@
 
 **Doc owner:** CDO-02  
 **Trạng thái:** Ready for W11 Pack #1 review  
-**Cập nhật lần cuối:** 2026-06-26 (sync contract-new-3)  
+**Cập nhật lần cuối:** 2026-06-26 (sync contract-new-4)  
 
 ## 1. Mục Tiêu Bảo Mật
 
@@ -97,7 +97,7 @@ graph TB
 - Audit/log traffic đi tới CloudWatch và S3.
 - Ưu tiên VPC endpoints cho S3, CloudWatch, Secrets Manager để giảm public exposure.
 
-**Egress NetworkPolicy (contract-new-3 §4.C):** AI Engine pod và CDO executor chỉ được phép egress HTTPS (port 443) ra ngoài cluster đến AWS VPC Endpoints. Egress đến K8s API Server từ AI Engine bị block — AI Engine không có quyền gọi Kubernetes API.
+**Egress NetworkPolicy (contract-new-4 §4.C):** AI Engine pod và CDO executor chỉ được phép egress HTTPS (port 443) ra ngoài cluster đến AWS VPC Endpoints. Egress đến K8s API Server từ AI Engine bị block — AI Engine không có quyền gọi Kubernetes API.
 
 ```yaml
 # Egress policy cho AI Engine pod
@@ -146,9 +146,9 @@ CDO-02 dùng namespace-based RBAC:
 | `tenant-a` | Workload tenant A |
 | `tenant-b` | Workload tenant B |
 | `argocd` | ArgoCD controller, repo-server, application-controller |
-| `self-heal-system` | AI Engine pod (do CDO deploy từ image AI bàn giao) + **CDO controller SA `tf3-cdo-controller` theo contract-new-3 §3.D** |
+| `self-heal-system` | AI Engine pod (do CDO deploy từ image AI bàn giao) + **CDO controller SA `tf3-cdo-controller` theo contract-new-4 §3.D** |
 
-> **Conflict cần giải quyết W12 (contract-new-3 §3.D):** Deployment contract yêu cầu CDO controller ServiceAccount tên `tf3-cdo-controller` phải nằm trong namespace `self-heal-system`. Thiết kế hiện tại của CDO đặt executor trong namespace `platform`. Trước W12 implementation, CDO phải quyết định: (a) di chuyển executor sang `self-heal-system`, hoặc (b) push-back với AI team để giữ `platform`. Quyết định này ảnh hưởng IRSA trust policy và RBAC binding.
+> **Conflict cần giải quyết W12 (contract-new-4 §3.D):** Deployment contract yêu cầu CDO controller ServiceAccount tên `tf3-cdo-controller` phải nằm trong namespace `self-heal-system`. Thiết kế hiện tại của CDO đặt executor trong namespace `platform`. Trước W12 implementation, CDO phải quyết định: (a) di chuyển executor sang `self-heal-system`, hoặc (b) push-back với AI team để giữ `platform`. Quyết định này ảnh hưởng IRSA trust policy và RBAC binding.
 
 RBAC principles:
 

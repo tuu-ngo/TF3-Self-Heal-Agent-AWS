@@ -2,7 +2,7 @@
 
 **Doc owner:** CDO-02  
 **Trạng thái:** Ready for W11 Pack #1 review  
-**Cập nhật lần cuối:** 2026-06-26 (sync contract-new-3)  
+**Cập nhật lần cuối:** 2026-06-26 (sync contract-new-4)  
 
 ## 1. Bối cảnh đề tài
 
@@ -182,7 +182,7 @@ Không dùng Authorization SigV4 — Auth cho AI endpoint là K8s NetworkPolicy 
 
 > **Ghi chú auth (updated 2026-06-25 → new contract)**: Auth cho AI endpoint là **Local Trust + K8s NetworkPolicy** (mTLS tùy chọn) — CDO Executor không cần SigV4 signing để gọi AI in-cluster. K8s NetworkPolicy restrict chỉ pods có label `app=cdo-self-heal-controller` mới được reach port 8080 của AI Engine. IRSA/EKS Pod Identity vẫn cần cho CDO Executor gọi các AWS services (S3, DynamoDB, CloudWatch, Secrets Manager).
 
-Luồng tích hợp (schema chốt contract-new-3, 2026-06-26):
+Luồng tích hợp (schema chốt contract-new-4, 2026-06-26):
 
 ```text
 [1] POST /v1/detect
@@ -208,14 +208,17 @@ Luồng tích hợp (schema chốt contract-new-3, 2026-06-26):
 
 [2] POST /v1/decide
     Request (bắt buộc): correlation_id, idempotency_key, dry_run_mode,
-                        anomaly_context: <FULL object từ detect response — bắt buộc theo contract-new-3>
+                        anomaly_context: <FULL object từ detect response — bắt buộc theo contract-new-4>
     Response: matched_runbook, pattern_type, action_plan[], blast_radius_config, verify_policy, cost_cap_exceeded,
-              rollback_snapshot: { memory_limit_mib, replica_count, image_tag, secret_version }  ← CDO phải lưu; dùng cho ROLLBACK path
+              correlation_id, idempotency_key, dry_run_mode (echoed back)
+              ⚠ AI KHÔNG trả rollback_snapshot — CDO tự capture TRƯỚC khi execute:
+                urgent path → đọc K8s API lấy current state → lưu audit log
+                deferred path → ghi Git commit SHA hiện tại → lưu audit log
     action_plan[] item: { action, target: "deployment/<name>", params: {namespace: "..."}, ... }
 
 [3] CDO execute action (theo pattern_type):
-    - urgent: execute trực tiếp K8s API (RESTART_DEPLOYMENT, PATCH_MEMORY_LIMIT, ROLLOUT_UNDO)
-    - deferred: tạo Git commit/PR → ArgoCD sync (SCALE_REPLICAS, ROTATE_SECRET)
+    - urgent: CDO capture snapshot → execute trực tiếp K8s API (RESTART_DEPLOYMENT, PATCH_MEMORY_LIMIT, ROLLOUT_UNDO)
+    - deferred: CDO capture snapshot (git SHA) → tạo Git commit/PR → ArgoCD sync (SCALE_REPLICAS, ROTATE_SECRET)
     CDO ghi lại: action, target string, status (COMPLETED | FAILED)
 
 [4] POST /v1/verify
@@ -230,7 +233,7 @@ Luồng tích hợp (schema chốt contract-new-3, 2026-06-26):
 CDO phải xử lý đầy đủ 4 giá trị next_action:
     - DONE      → close incident, ghi audit incident_closed
     - RETRY     → retry action với same pattern, ghi audit retrying
-    - ROLLBACK  → chạy rollback dùng `rollback_snapshot` từ DecideResponse để khôi phục trạng thái trước action (kubectl rollout undo / revert manifest về state snapshot), ghi audit rollback_done
+    - ROLLBACK  → chạy rollback dùng snapshot CDO đã capture trước execute (từ audit log) để khôi phục trạng thái trước action (kubectl rollout undo / revert manifest về state snapshot), ghi audit rollback_done
     - ESCALATE  → gửi escalation_bundle lên channel cảnh báo, ghi audit escalated (không execute thêm)
 ```
 
@@ -318,10 +321,10 @@ Tất cả các điểm dưới đây đã được xác nhận trong 3 contract
 - ✅ Rate limit: `/v1/detect` 100 RPS/tenant; `/v1/decide` và `/v1/verify` 10 RPS/tenant.
 - ✅ `pattern_type: "deferred"` — CDO tạo Git commit/PR, không direct mutate K8s.
 - ✅ Dead-Letter Queue (DLQ) bắt buộc khi telemetry bị AI reject (400) — confirmed telemetry contract section 2.5.B.
-- ✅ **`rollback_snapshot` bắt buộc trong DecideResponse (contract-new-3)**: AI trả `rollback_snapshot` ghi lại trạng thái trước action (`memory_limit_mib`, `replica_count`, `image_tag`, `secret_version`). CDO executor phải lưu và dùng khi `/v1/verify` trả `next_action=ROLLBACK`.
-- ✅ **Idempotency lock scope (contract-new-3 §3.D)**: DynamoDB lock CHỈ áp dụng cho `/v1/decide`. `/v1/detect` và `/v1/verify` dùng Idempotency-Key cho audit trail, không lock.
-- ✅ **403 Forbidden (contract-new-3)**: Trả về khi `X-Tenant-Id` header không khớp `tenant_id` trong payload — CDO xử lý bằng audit + retry sau khi kiểm tra header.
-- ✅ **CDO controller SA namespace (deployment contract-new-3 §3.D)**: Contract yêu cầu `tf3-cdo-controller` ServiceAccount nằm trong namespace `self-heal-system`. CDO hiện thiết kế executor trong `platform` — cần resolution W12 trước khi apply manifest.
+- ✅ **CDO self-capture rollback snapshot (contract-new-4)**: AI KHÔNG trả `rollback_snapshot`. CDO phải capture TRƯỚC khi execute — urgent path: đọc K8s API lấy current state (`memory_limit`, `replica_count`, `image_tag`) → lưu audit log; deferred path: ghi Git commit SHA hiện tại → lưu audit log. Dùng để restore khi `/v1/verify` trả `next_action=ROLLBACK`.
+- ✅ **Idempotency lock scope (contract-new-4 §3.D)**: DynamoDB lock CHỈ áp dụng cho `/v1/decide`. `/v1/detect` và `/v1/verify` dùng Idempotency-Key cho audit trail, không lock.
+- ✅ **403 Forbidden (contract-new-4)**: Trả về khi `X-Tenant-Id` header không khớp `tenant_id` trong payload — CDO xử lý bằng audit + retry sau khi kiểm tra header.
+- ✅ **CDO controller SA namespace (deployment contract-new-4 §3.D)**: Contract yêu cầu `tf3-cdo-controller` ServiceAccount nằm trong namespace `self-heal-system`. CDO hiện thiết kế executor trong `platform` — cần resolution W12 trước khi apply manifest.
 
 ## 10. Giả Định
 
@@ -347,7 +350,7 @@ Tổng hợp trạng thái các câu hỏi với AI team và trainer/mentor.
 5. ✅ **AI skeleton endpoint URL** — endpoint nội bộ: `http://ai-engine.self-heal-system.svc.cluster.local:8080/` (confirmed deployment contract). CDO dùng endpoint này khi deploy AI image vào EKS.
 6. ✅ **503 fallback**: CDO escalate + audit, không execute mặc định (static runbook fallback nếu AI/CDO đã thống nhất).
 7. ✅ **SQS CDO-internal**: confirmed trong telemetry contract section 2.5.C.
-8. ✅ **I/O schema chốt (contract-new-3, 2026-06-26)**: `/v1/decide` request bắt buộc `anomaly_context` (full object từ detect); response bổ sung `rollback_snapshot` (required) và `matched_runbook` (required); `/v1/verify` request bắt buộc `action_executed` ({action, target string, status COMPLETED|FAILED}) và `post_telemetry_window` (required từ contract-new-3); response bắt buộc `next_action` (DONE|RETRY|ROLLBACK|ESCALATE) và `regression_detected`; `escalation_bundle` khi `next_action=ESCALATE`. Action target format: `"target": "deployment/<name>"` (string); namespace qua `params.namespace`. DLQ alert threshold: > 0.5% malformed trong 5 phút.
+8. ✅ **I/O schema chốt (contract-new-4, 2026-06-26)**: `/v1/decide` request bắt buộc `anomaly_context` (full object từ detect); response bắt buộc `matched_runbook`, `pattern_type`, `action_plan[]`, `blast_radius_config`, `verify_policy`, và echo-back `correlation_id`, `idempotency_key`, `dry_run_mode` — **AI KHÔNG trả `rollback_snapshot`** (removed in contract-new-4); `/v1/verify` request bắt buộc `action_executed` ({action, target string, status COMPLETED|FAILED}) và `post_telemetry_window` (required từ contract-new-4); response bắt buộc `next_action` (DONE|RETRY|ROLLBACK|ESCALATE) và `regression_detected`; `escalation_bundle` khi `next_action=ESCALATE`. Action target format: `"target": "deployment/<name>"` (string); namespace qua `params.namespace`. DLQ alert threshold: > 0.5% malformed trong 5 phút.
 
 ### 11.2 Cần xác nhận với trainer/mentor (W12)
 

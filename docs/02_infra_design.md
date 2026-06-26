@@ -2,7 +2,7 @@
 
 **Doc owner:** CDO-02  
 **Trạng thái:** Ready for W11 Pack #1 review  
-**Cập nhật lần cuối:** 2026-06-26 (sync contract-new-3)  
+**Cập nhật lần cuối:** 2026-06-26 (sync contract-new-4)  
 
 ## 1. Mục tiêu kiến trúc
 
@@ -100,10 +100,13 @@ Caption: CDO executor là điểm điều phối chính. AI chỉ đưa ra decis
 6. AI trả matched_runbook, action_plan[], pattern_type, blast_radius_config, verify_policy, cost_cap_exceeded.
 7. Safety gate validate: tenant_id, namespace, allowed_namespaces, blast-radius, rollback plan, verify_policy, idempotency key, action allow-list.
 8a. [URGENT PATH] Nếu pattern_type = "urgent":
+    - CDO capture rollback snapshot TRƯỚC khi execute: đọc K8s API lấy current state
+      (memory_limit, replica_count, image_tag) → lưu vào audit log (AI không trả rollback_snapshot)
     - CDO executor gọi Kubernetes API trực tiếp (RESTART_DEPLOYMENT, PATCH_MEMORY_LIMIT, ROLLOUT_UNDO)
     - Chạy server-side dry-run trước, nếu pass thì execute thật
     - RTO target < 60 giây
 8b. [DEFERRED PATH] Nếu pattern_type = "deferred":
+    - CDO capture rollback snapshot TRƯỚC khi execute: ghi Git commit SHA hiện tại → lưu vào audit log
     - CDO executor KHÔNG gọi Kubernetes API
     - Executor tạo Git commit cập nhật manifest (ROTATE_SECRET, SCALE_REPLICAS)
     - ArgoCD phát hiện commit → sync vào cluster (~30-60s)
@@ -125,8 +128,8 @@ CDO-02 consume AI API Contract như sau:
 | API | CDO usage |
 |---|---|
 | `POST /v1/detect` | Gửi telemetry/context để AI xác định anomaly. Bắt buộc: `Idempotency-Key`, `X-Dry-Run-Mode` |
-| `POST /v1/decide` | **Request bắt buộc**: `anomaly_context` (full object từ detect response — contract-new-3). **Response**: `matched_runbook` (required), `pattern_type`, `action_plan[]` (target là string "deployment/\<name\>"), `blast_radius_config`, `verify_policy`, `cost_cap_exceeded`, `rollback_snapshot: { memory_limit_mib, replica_count, image_tag, secret_version }` (required — CDO lưu để dùng khi ROLLBACK) |
-| `POST /v1/verify` | **Request bắt buộc**: `correlation_id`, `idempotency_key`, `dry_run_mode`, `action_executed`, `post_telemetry_window` (required từ contract-new-3). **Response**: `success`, `regression_detected`, `next_action` (DONE/RETRY/ROLLBACK/ESCALATE), `escalation_bundle` (khi `next_action=ESCALATE`: `{ reason, logs, metrics }`) |
+| `POST /v1/decide` | **Request bắt buộc**: `anomaly_context` (full object từ detect response — contract-new-4). **Response required**: `matched_runbook`, `pattern_type`, `action_plan[]` (target là string "deployment/\<name\>"), `blast_radius_config`, `verify_policy`, `correlation_id`, `idempotency_key`, `dry_run_mode` (echoed back), `cost_cap_exceeded` (optional). **⚠ AI KHÔNG trả `rollback_snapshot`** — CDO tự capture trước khi execute: urgent path → đọc K8s API lấy current state (memory_limit, replica_count, image_tag) → lưu audit log; deferred path → ghi Git commit SHA hiện tại → dùng để revert khi `next_action=ROLLBACK` |
+| `POST /v1/verify` | **Request bắt buộc**: `correlation_id`, `idempotency_key`, `dry_run_mode`, `action_executed`, `post_telemetry_window` (required từ contract-new-4). **Response**: `success`, `regression_detected`, `next_action` (DONE/RETRY/ROLLBACK/ESCALATE), `escalation_bundle` (khi `next_action=ESCALATE`: `{ reason, logs, metrics }`) |
 
 Headers/auth theo contract:
 
@@ -138,12 +141,12 @@ X-Correlation-Id: UUID v4 (tùy chọn detect; bắt buộc decide/verify)
 ```
 Không dùng Authorization SigV4 — AI endpoint dùng K8s NetworkPolicy in-cluster (Local Trust).
 
-SLA và abort criteria theo contract-new-3:
+SLA và abort criteria theo contract-new-4:
 
 | Endpoint | p99 target | Abort threshold | Rate limit |
 |---|---|---|---|
 | `/v1/detect` | < 300ms | p99 > 800ms hoặc 5xx > 1% → trigger rollback | 100 RPS/tenant |
-| `/v1/decide` | < 3000ms (LLM) / < 500ms (rule fallback) | p99 > 3500ms hoặc 5xx > 1% → trigger rollback | 10 RPS/tenant |
+| `/v1/decide` | < 3000ms (LLM) / < 500ms (rule fallback) | p99 > 3000ms hoặc 5xx > 1% → trigger rollback | 10 RPS/tenant |
 | `/v1/verify` | < 500ms | p99 > 1000ms hoặc 5xx > 1% → trigger rollback | 10 RPS/tenant |
 
 Các action CDO sẽ hỗ trợ theo allow-list:
@@ -167,17 +170,19 @@ ROTATE_SECRET    ← confirmed build thật (trigger: secret_expiry_warning, pat
 
 **Xử lý `cost_cap_exceeded: true`:** AI đã chuyển sang rule-based fallback (4 trigger: chi phí > $50/ngày, Bedrock 429, AI timeout, LLM parse failure). CDO vẫn execute action plan nhưng phải log cảnh báo, thông báo team.
 
-**Idempotency lock scope (contract-new-3):** DynamoDB conditional write lock CHỈ áp dụng cho `/v1/decide` — ngăn duplicate execution. `/v1/detect` và `/v1/verify` gửi `Idempotency-Key` cho audit trail, không lock.
+**Idempotency lock scope (contract-new-4):** DynamoDB conditional write lock CHỈ áp dụng cho `/v1/decide` — ngăn duplicate execution. `/v1/detect` và `/v1/verify` gửi `Idempotency-Key` cho audit trail, không lock.
 
 **HTTP error codes CDO phải xử lý:**
 
 | Code | Nghĩa | CDO action |
 |---|---|---|
 | `400` | Malformed request | Không retry; ghi audit; đưa vào DLQ nếu là telemetry |
+| `401 Unauthorized` | Local Trust / mTLS config sai hoặc phân quyền tenant không hợp lệ | Không retry; kiểm tra NetworkPolicy và ServiceAccount config; ghi audit `auth_config_error` |
 | `403 Forbidden` | `X-Tenant-Id` không khớp `tenant_id` trong payload | Không retry; ghi audit `tenant_mismatch`; kiểm tra header config |
 | `409` | Trùng `Idempotency-Key` | Không retry; incident đã được xử lý trước đó |
 | `429` | Rate limit | Exponential backoff theo header `Retry-After` |
-| `503` | AI unavailable | Escalate + audit `ai_unavailable_escalated`; không execute mặc định |
+| `500` | Lỗi nội bộ AI Engine | Retry tối đa **2 lần** với exponential backoff (1s, 3s); nếu vẫn thất bại → escalate + audit `ai_internal_error` |
+| `503` | AI unavailable (upstream Bedrock/DDB/S3 down) | Không retry; escalate + audit `ai_unavailable_escalated`; không execute mặc định |
 
 **Telemetry DLQ:** Khi AI reject telemetry (400), CDO chuyển message vào Dead-Letter Queue để phân tích. Alert nếu tỷ lệ malformed > 0.5% trong 5 phút.
 

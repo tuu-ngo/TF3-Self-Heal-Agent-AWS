@@ -2,7 +2,7 @@
 
 **Doc owner:** CDO-02  
 **Trạng thái:** Ready for W11 Pack #1 review  
-**Last updated:** 2026-06-26 (sync contract-new-3 — abort criteria, probe config, rollout strategy, SA namespace conflict)  
+**Last updated:** 2026-06-26 (sync contract-new-4 — abort criteria, probe config, rollout strategy, SA namespace conflict)  
 
 ## 1. Chiến lược IaC
 
@@ -392,7 +392,7 @@ Trong scope capstone, CDO-02 chọn **rolling update** là deployment strategy c
 - Khớp với EKS/Kubernetes deployment model.
 - Giảm rủi ro over-design khi repo chưa có bằng chứng cho traffic split canary.
 
-**Rollout spec (deployment contract-new-3 §2.C):**
+**Rollout spec (deployment contract-new-4 §2.C):**
 
 ```yaml
 strategy:
@@ -416,12 +416,12 @@ Một deployment được xem là không an toàn nếu có các dấu hiệu sa
 - Verify step thất bại hoặc phát hiện regression.
 - Alert firing mới xuất hiện ngay sau deploy đối với thành phần vừa thay đổi.
 
-**Abort criteria per AI API endpoint (deployment contract-new-3 §6.B):**
+**Abort criteria per AI API endpoint (deployment contract-new-4 §6.B):**
 
 | Endpoint | Abort trigger | CDO action |
 |---|---|---|
 | `/v1/detect` | p99 > 800ms hoặc 5xx > 1% | Trigger rollback, escalate |
-| `/v1/decide` | p99 > 3500ms hoặc 5xx > 1% | Trigger rollback, escalate |
+| `/v1/decide` | p99 > 3000ms hoặc 5xx > 1% | Trigger rollback, escalate |
 | `/v1/verify` | p99 > 1000ms hoặc 5xx > 1% | Trigger rollback, escalate |
 
 Các ngưỡng này áp dụng trong cửa sổ đo 5 phút. Nếu vượt ngưỡng, CDO dừng gọi AI endpoint đó và chuyển sang escalation path.
@@ -569,7 +569,7 @@ EKS workloads
 
 ## 8. AI Engine Deployment Spec (CDO-managed, W12)
 
-CDO-02 chịu trách nhiệm deploy AI Engine từ OCI image do AI team bàn giao. Image sẽ có trong W12; CDO chuẩn bị manifest sẵn theo spec trong deployment contract-new-3 để apply ngay khi nhận được image.
+CDO-02 chịu trách nhiệm deploy AI Engine từ OCI image do AI team bàn giao. Image sẽ có trong W12; CDO chuẩn bị manifest sẵn theo spec trong deployment contract-new-4 để apply ngay khi nhận được image.
 
 ### 8.1 Resource spec (deployment contract §2.A)
 
@@ -609,7 +609,7 @@ metrics:
 - AI Engine đọc Bedrock credentials từ AWS Secrets Manager path `tf-3/ai-engine/bedrock` qua IRSA.
 - IAM role `cdo-ai-engine-irsa-<cluster>` có quyền: Bedrock invoke, S3 audit write, DynamoDB idempotency, SecretsManager GetSecretValue cho path `tf-3/ai-engine/bedrock`.
 
-### 8.4 Probes (deployment contract-new-3 §2.D)
+### 8.4 Probes (deployment contract-new-4 §2.D)
 
 ```yaml
 livenessProbe:
@@ -632,11 +632,11 @@ readinessProbe:
 
 AI Engine pod phải có label `app: ai-engine` — bắt buộc để NetworkPolicy `allow-executor-to-ai` trong namespace `self-heal-system` hoạt động đúng (chỉ cho phép executor pod từ namespace `platform` reach port 8080).
 
-**Egress NetworkPolicy (contract-new-3 §4.C):** AI Engine chỉ được egress HTTPS:443 ra AWS VPC Endpoints. Egress đến K8s API Server bị block.
+**Egress NetworkPolicy (contract-new-4 §4.C):** AI Engine chỉ được egress HTTPS:443 ra AWS VPC Endpoints. Egress đến K8s API Server bị block.
 
 ### 8.6 CDO Controller ServiceAccount — Conflict cần giải quyết
 
-**Contract-new-3 §3.D** yêu cầu CDO controller ServiceAccount tên `tf3-cdo-controller` phải nằm trong namespace `self-heal-system`:
+**Contract-new-4 §3.D** yêu cầu CDO controller ServiceAccount tên `tf3-cdo-controller` phải nằm trong namespace `self-heal-system`:
 
 ```yaml
 serviceAccountName: tf3-cdo-controller
