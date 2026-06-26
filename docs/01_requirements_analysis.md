@@ -2,7 +2,7 @@
 
 **Doc owner:** CDO-02  
 **Trạng thái:** Ready for W11 Pack #1 review  
-**Cập nhật lần cuối:** 2026-06-25 (sync AI commit 86b32e7)  
+**Cập nhật lần cuối:** 2026-06-26 (sync contract-new-3)  
 
 ## 1. Bối cảnh đề tài
 
@@ -191,8 +191,9 @@ Luồng tích hợp (schema chốt contract-new-2, 2026-06-25):
 
 [2] POST /v1/decide
     Request (bắt buộc): correlation_id, idempotency_key, dry_run_mode,
-                        anomaly_context: <FULL object từ detect response — bắt buộc theo contract-new-2>
-    Response: matched_runbook, pattern_type, action_plan[], blast_radius_config, verify_policy, cost_cap_exceeded
+                        anomaly_context: <FULL object từ detect response — bắt buộc theo contract-new-3>
+    Response: matched_runbook, pattern_type, action_plan[], blast_radius_config, verify_policy, cost_cap_exceeded,
+              rollback_snapshot: { memory_limit_mib, replica_count, image_tag, secret_version }  ← CDO phải lưu; dùng cho ROLLBACK path
     action_plan[] item: { action, target: "deployment/<name>", params: {namespace: "..."}, ... }
 
 [3] CDO execute action (theo pattern_type):
@@ -212,7 +213,7 @@ Luồng tích hợp (schema chốt contract-new-2, 2026-06-25):
 CDO phải xử lý đầy đủ 4 giá trị next_action:
     - DONE      → close incident, ghi audit incident_closed
     - RETRY     → retry action với same pattern, ghi audit retrying
-    - ROLLBACK  → chạy rollback (kubectl rollout undo hoặc revert commit), ghi audit rollback_done
+    - ROLLBACK  → chạy rollback dùng `rollback_snapshot` từ DecideResponse để khôi phục trạng thái trước action (kubectl rollout undo / revert manifest về state snapshot), ghi audit rollback_done
     - ESCALATE  → gửi escalation_bundle lên channel cảnh báo, ghi audit escalated (không execute thêm)
 ```
 
@@ -241,6 +242,7 @@ SLA/API behavior từ contract (cập nhật W11):
 - Availability target 99.9%.
 - Rate limit: `/v1/detect` 100 RPS/tenant; `/v1/decide` và `/v1/verify` 10 RPS/tenant.
 - `400`: không retry tự động.
+- `403 Forbidden`: `X-Tenant-Id` header không khớp `tenant_id` trong payload — không retry, ghi audit `tenant_mismatch`.
 - `409`: trùng `Idempotency-Key`.
 - `429`: exponential backoff (response có header `Retry-After`).
 - `503`: CDO phải fallback bằng static runbook hoặc escalation.
@@ -251,11 +253,11 @@ CDO-02 sẽ đáp ứng bằng cách:
 - Chỉ execute các action nằm trong allow-list của contract mới: `RESTART_DEPLOYMENT`, `PATCH_MEMORY_LIMIT`, `SCALE_REPLICAS`, `ROLLOUT_UNDO`, `ROTATE_SECRET`.
 - `ROTATE_SECRET` được xác nhận là **build thật** (confirmed từ AI contract). CDO implement với safety gate đầy đủ: chỉ thực thi khi signal `secret_expiry_warning` trigger, target `secret_name` phải nằm trong allow-list đã định nghĩa, và bắt buộc có `verify_policy`.
 - Validate `tenant_id`, target namespace, `allowed_namespaces`, blast-radius, local rollback/runbook path và `verify_policy` trước khi execute.
-- Dùng `Idempotency-Key` (bắt buộc cho cả ba endpoints, UUID v4) để tránh execute trùng một incident.
+- Dùng `Idempotency-Key` (bắt buộc cho cả ba endpoints, UUID v4). **DynamoDB idempotency lock chỉ áp dụng cho `/v1/decide`** — lock conditional write ngăn duplicate execution của cùng action. `/v1/detect` và `/v1/verify` dùng key cho mục đích audit trail, không có lock.
 - Gửi `X-Dry-Run-Mode` header bắt buộc cho mọi request.
 - Với `pattern_type: "urgent"`: execute trực tiếp qua Kubernetes API sau safety gate.
 - Với `pattern_type: "deferred"`: **không direct mutate Kubernetes**; tạo Git commit/PR để ArgoCD sync.
-- Khi nhận `cost_cap_exceeded: true`: log cảnh báo, vẫn execute action plan, thông báo team.
+- Khi nhận `cost_cap_exceeded: true` (AI đã chuyển sang rule-based fallback): log cảnh báo, vẫn execute action plan bình thường, thông báo team. 4 điều kiện kích hoạt rule-based fallback: (1) chi phí vượt $50/ngày/tenant; (2) Bedrock trả HTTP 429; (3) AI endpoint downtime/timeout; (4) LLM parse failure.
 - Với `429`, dùng retry/backoff theo contract (header `Retry-After`).
 - Với `503`, mặc định không tự ý execute; CDO sẽ escalate + audit, trừ khi static runbook fallback đã được AI/CDO thống nhất.
 
@@ -299,6 +301,10 @@ Tất cả các điểm dưới đây đã được xác nhận trong 3 contract
 - ✅ Rate limit: `/v1/detect` 100 RPS/tenant; `/v1/decide` và `/v1/verify` 10 RPS/tenant.
 - ✅ `pattern_type: "deferred"` — CDO tạo Git commit/PR, không direct mutate K8s.
 - ✅ Dead-Letter Queue (DLQ) bắt buộc khi telemetry bị AI reject (400) — confirmed telemetry contract section 2.5.B.
+- ✅ **`rollback_snapshot` bắt buộc trong DecideResponse (contract-new-3)**: AI trả `rollback_snapshot` ghi lại trạng thái trước action (`memory_limit_mib`, `replica_count`, `image_tag`, `secret_version`). CDO executor phải lưu và dùng khi `/v1/verify` trả `next_action=ROLLBACK`.
+- ✅ **Idempotency lock scope (contract-new-3 §3.D)**: DynamoDB lock CHỈ áp dụng cho `/v1/decide`. `/v1/detect` và `/v1/verify` dùng Idempotency-Key cho audit trail, không lock.
+- ✅ **403 Forbidden (contract-new-3)**: Trả về khi `X-Tenant-Id` header không khớp `tenant_id` trong payload — CDO xử lý bằng audit + retry sau khi kiểm tra header.
+- ✅ **CDO controller SA namespace (deployment contract-new-3 §3.D)**: Contract yêu cầu `tf3-cdo-controller` ServiceAccount nằm trong namespace `self-heal-system`. CDO hiện thiết kế executor trong `platform` — cần resolution W12 trước khi apply manifest.
 
 ## 10. Giả Định
 
@@ -324,7 +330,7 @@ Tổng hợp trạng thái các câu hỏi với AI team và trainer/mentor.
 5. ✅ **AI skeleton endpoint URL** — endpoint nội bộ: `http://ai-engine.self-heal-system.svc.cluster.local:8080/` (confirmed deployment contract). CDO dùng endpoint này khi deploy AI image vào EKS.
 6. ✅ **503 fallback**: CDO escalate + audit, không execute mặc định (static runbook fallback nếu AI/CDO đã thống nhất).
 7. ✅ **SQS CDO-internal**: confirmed trong telemetry contract section 2.5.C.
-8. ✅ **I/O schema chốt (contract-new-2, 2026-06-25)**: `/v1/decide` request bắt buộc `anomaly_context` (full object từ detect); `/v1/verify` request bắt buộc `action_executed` ({action, target string, status COMPLETED|FAILED}); response bắt buộc `next_action` (DONE|RETRY|ROLLBACK|ESCALATE) và `regression_detected`. Action target format: `"target": "deployment/<name>"` (string); namespace qua `params.namespace`. DLQ alert threshold: > 0.5% malformed trong 5 phút.
+8. ✅ **I/O schema chốt (contract-new-3, 2026-06-26)**: `/v1/decide` request bắt buộc `anomaly_context` (full object từ detect); response bổ sung `rollback_snapshot` (required) và `matched_runbook` (required); `/v1/verify` request bắt buộc `action_executed` ({action, target string, status COMPLETED|FAILED}) và `post_telemetry_window` (required từ contract-new-3); response bắt buộc `next_action` (DONE|RETRY|ROLLBACK|ESCALATE) và `regression_detected`; `escalation_bundle` khi `next_action=ESCALATE`. Action target format: `"target": "deployment/<name>"` (string); namespace qua `params.namespace`. DLQ alert threshold: > 0.5% malformed trong 5 phút.
 
 ### 11.2 Cần xác nhận với trainer/mentor (W12)
 

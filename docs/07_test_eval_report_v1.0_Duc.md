@@ -2,7 +2,7 @@
 
 **Doc owner:** CDO-02  
 **Trạng thái:** Draft cho W12 Pack #2 execution  
-**Cập nhật lần cuối:** 2026-06-25 (sync AI commit 86b32e7)  
+**Cập nhật lần cuối:** 2026-06-26 (sync contract-new-3)  
 
 ## 1. Mục tiêu tài liệu
 
@@ -54,6 +54,7 @@ Các SLO dưới đây là target cho W12 Pack #2. Cột measured chỉ được
 |---|---:|---:|---|---|
 | CDO executor availability trong simulation | >= 99.5% | TBD | >= 4h scenario window | TBD |
 | AI API call p99 do CDO observe | detect < 300ms; decide < 3000ms (LLM) / < 500ms (fallback); verify < 500ms | TBD | Scenario run | TBD |
+| AI API abort threshold (contract-new-3 §6.B) | detect p99 ≤ 800ms; decide p99 ≤ 3500ms; verify p99 ≤ 1000ms; 5xx ≤ 1% | TBD | 5-min measurement window | TBD |
 | End-to-end auto-heal latency | < 5 min cho safe restart/scale cases | TBD | Successful auto-resolve cases | TBD |
 | Audit write coverage | 100% incidents | TBD | Scenario run | TBD |
 | Unsafe action rate | 0% | TBD | Scenario run | TBD |
@@ -98,6 +99,7 @@ Nếu có SLO miss sau khi chạy test, điền bảng này để giải thích 
 | TC-15 | Circuit breaker | Quá nhiều action fail trong thời gian ngắn | Stop automation | Các action tiếp theo bị deny tới khi breaker reset |
 | TC-16 | `pattern_type: deferred` routing | AI trả `pattern_type: "deferred"` (e.g. SCALE_REPLICAS) | CDO tạo Git commit/PR, **không** gọi K8s API trực tiếp | Không có K8s mutation, có Git commit/PR evidence, audit ghi `deferred_gitops_path` |
 | TC-17 | `cost_cap_exceeded: true` handling | AI `/v1/decide` trả `cost_cap_exceeded: true` | CDO log warning + notify, vẫn execute action plan theo safety gate | Audit ghi `cost_cap_exceeded_warning`, action executed bình thường |
+| TC-18 | 403 Tenant mismatch | `X-Tenant-Id` header ≠ `tenant_id` trong payload | CDO nhận 403, không retry, ghi audit | Audit ghi `tenant_mismatch`, không có action execute |
 
 ## 6. Detailed Test Cases
 
@@ -116,12 +118,12 @@ Nếu có SLO miss sau khi chạy test, điền bảng này để giải thích 
 
 1. Inject alert với `correlation_id=tc-01-*`, tenant `tenant-a`, namespace `tenant-a`.
 2. Cung cấp telemetry cho thấy `service_latency_p95` cao bất thường.
-3. CDO gọi `/v1/detect`; lưu `anomaly_context` từ response. CDO gọi `/v1/decide` với body bao gồm `anomaly_context` (bắt buộc theo contract-new-2).
-4. AI trả `RESTART_DEPLOYMENT` cho một deployment, có `verify_policy`; CDO có local rollback/runbook path.
-5. Safety gate validate tenant, allow-list, blast-radius, rollback/runbook path, `verify_policy` và idempotency.
+3. CDO gọi `/v1/detect`; lưu `anomaly_context` từ response. CDO gọi `/v1/decide` với body bao gồm `anomaly_context` (bắt buộc theo contract-new-3).
+4. AI trả `RESTART_DEPLOYMENT` cho một deployment, có `verify_policy`, `matched_runbook`, và `rollback_snapshot` — CDO **lưu lại `rollback_snapshot`** để dùng khi `next_action=ROLLBACK`.
+5. Safety gate validate tenant, allow-list, blast-radius, rollback/runbook path, `verify_policy` và idempotency (DynamoDB lock cho `/v1/decide`).
 6. CDO chạy server-side dry-run.
 7. CDO execute hoặc mock-execute restart. Ghi lại: action, target (string "deployment/\<name\>"), status (COMPLETED|FAILED).
-8. CDO gọi `/v1/verify` với `action_executed: { action, target, status, execution_time_seconds }` và `post_telemetry_window`. Xử lý `next_action`: DONE → close; RETRY → retry; ROLLBACK → rollback; ESCALATE → gửi bundle.
+8. CDO gọi `/v1/verify` với `action_executed: { action, target, status, execution_time_seconds }` và `post_telemetry_window` (required). Xử lý `next_action`: DONE → close; RETRY → retry; ROLLBACK → restore `rollback_snapshot`; ESCALATE → gửi `escalation_bundle`.
 9. CDO ghi full audit trail.
 
 **Expected result:** Incident được close dưới trạng thái auto-resolved. Audit có `safety_passed`, `dry_run_done`, `execute_done`, `verify_done`, `incident_closed`.
@@ -166,7 +168,7 @@ Nếu có SLO miss sau khi chạy test, điền bảng này để giải thích 
    # POST tới CDO telemetry ingestion endpoint
    ```
 2. CDO gọi `/v1/detect`; lưu `anomaly_context` từ response.
-3. CDO gọi `/v1/decide` với body bao gồm `anomaly_context` (bắt buộc contract-new-2) — expect AI trả `SCALE_REPLICAS`, `pattern_type: "deferred"`, `verify_policy` có `window_seconds`.
+3. CDO gọi `/v1/decide` với body bao gồm `anomaly_context` (bắt buộc contract-new-3) — expect AI trả `SCALE_REPLICAS`, `pattern_type: "deferred"`, `verify_policy` có `window_seconds`, `matched_runbook`, và `rollback_snapshot`. CDO **lưu lại `rollback_snapshot`**.
 4. Safety gate validate: tenant match, namespace in allow-list, blast-radius (current replicas + delta <= 10), action in allow-list, idempotency.
 5. CDO **không** gọi K8s API trực tiếp — tạo Git commit cập nhật `replicas` trong `manifests/tenant-b/notification-service/values.yaml`.
 6. ArgoCD detect commit → sync → deployment scales up. CDO ghi: action="SCALE_REPLICAS", target="deployment/notification-service", status=COMPLETED.
@@ -208,9 +210,21 @@ Nếu có SLO miss sau khi chạy test, điền bảng này để giải thích 
 1. Inject một safe action scenario.
 2. Trả kết quả dry-run/execute success.
 3. Cung cấp post-action telemetry cho thấy regression.
-4. CDO gọi `/v1/verify`.
+4. CDO gọi `/v1/verify` với `post_telemetry_window` (required).
+5. AI trả `next_action=ROLLBACK` kèm `escalation_bundle` (nếu `next_action=ESCALATE`).
 
-**Expected result:** CDO chạy rollback nếu local rollback/runbook path an toàn; nếu không thì escalate. Audit có `verify_regression` và `rollback_done` hoặc `escalated`.
+**Expected result:** CDO dùng `rollback_snapshot` đã lưu từ DecideResponse để restore trạng thái trước action (kubectl rollout undo / revert manifest). Nếu `next_action=ESCALATE`, CDO gửi `escalation_bundle` {reason, logs, metrics} lên channel cảnh báo — không execute thêm action. Audit có `verify_regression` và `rollback_done` hoặc `escalated`.
+
+### TC-18 - 403 Tenant Mismatch Handling
+
+**Goal:** Chứng minh CDO xử lý đúng khi `X-Tenant-Id` header không khớp `tenant_id` trong payload.
+
+**Steps:**
+
+1. Tạo request gọi `/v1/detect` với `X-Tenant-Id: <tenant-a UUID>` nhưng payload có `tenant_id: <tenant-b UUID>`.
+2. Quan sát response.
+
+**Expected result:** AI trả `403 Forbidden`. CDO không retry, ghi audit `tenant_mismatch`, kiểm tra lại header config trước khi gửi tiếp. Không có action nào được execute.
 
 ## 7. Scenario Simulation Plan
 
