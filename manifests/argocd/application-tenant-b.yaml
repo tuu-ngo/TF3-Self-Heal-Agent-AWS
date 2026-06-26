@@ -10,7 +10,7 @@ spec:
 
   source:
     repoURL: https://github.com/tuu-ngo/TF3-Self-Heal-Agent-AWS.git
-    targetRevision: main
+    targetRevision: codex-argocd-rewire
     path: manifests/workloads/tenant-b
 
   destination:
