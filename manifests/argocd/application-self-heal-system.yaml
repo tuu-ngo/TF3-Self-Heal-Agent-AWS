@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: self-heal-system-runtime
+  namespace: argocd
+  labels:
+    tenant_id: platform
+spec:
+  project: self-heal-system
+  source:
+    repoURL: https://github.com/tuu-ngo/TF3-Self-Heal-Agent-AWS.git
+    targetRevision: codex-argocd-rewire
+    path: manifests/self-heal-system
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: self-heal-system
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: false
+    syncOptions:
+      - CreateNamespace=false

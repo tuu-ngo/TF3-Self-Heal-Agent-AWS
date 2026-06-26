@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: self-heal-system
+  namespace: argocd
+spec:
+  description: "ArgoCD project for self-heal system runtime (CDO-02)"
+  sourceRepos:
+    - "*"
+  destinations:
+    - namespace: self-heal-system
+      server: https://kubernetes.default.svc
+    - namespace: platform
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist: []
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
