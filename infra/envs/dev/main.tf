@@ -48,15 +48,14 @@ module "secrets" {
   source = "../../modules/secrets"
 }
 
-module "kyverno" {
-  source = "../../modules/kyverno"
-
-  depends_on = [module.eks]
-}
-
-module "argocd" {
-  source      = "../../modules/argocd"
-  environment = var.environment
-
-  depends_on = [module.eks]
-}
+# kyverno + argocd dùng helm provider — apply sau khi EKS tồn tại (phase 2)
+# module "kyverno" {
+#   source = "../../modules/kyverno"
+#   depends_on = [module.eks]
+# }
+#
+# module "argocd" {
+#   source      = "../../modules/argocd"
+#   environment = var.environment
+#   depends_on  = [module.eks]
+# }
