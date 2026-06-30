@@ -166,3 +166,51 @@ resource "aws_iam_role_policy" "ai_engine" {
   role   = aws_iam_role.ai_engine.id
   policy = data.aws_iam_policy_document.ai_engine_policy.json
 }
+
+# ---------------------------------------------------------------------------
+# IRSA — Alert Forwarder (Alertmanager webhook → SQS, telemetry-contract §2.5.C)
+# Least-privilege: CHỈ được SendMessage vào telemetry queue. Không đọc/xóa, không K8s.
+# SA `cdo-telemetry-forwarder` trong namespace `monitoring` (kube-prometheus-stack).
+# ---------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "forwarder_trust" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [var.oidc_provider_arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = local.oidc_subject
+      values   = ["system:serviceaccount:monitoring:cdo-telemetry-forwarder"]
+    }
+  }
+}
+
+resource "aws_iam_role" "forwarder" {
+  name               = "cdo-forwarder-irsa-${var.cluster_name}"
+  assume_role_policy = data.aws_iam_policy_document.forwarder_trust.json
+}
+
+data "aws_iam_policy_document" "forwarder_policy" {
+  statement {
+    sid    = "TelemetrySQSSend"
+    effect = "Allow"
+    actions = [
+      "sqs:SendMessage",
+      "sqs:GetQueueUrl",
+      "sqs:GetQueueAttributes",
+    ]
+    resources = [var.sqs_queue_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "forwarder" {
+  name   = "cdo-forwarder-policy"
+  role   = aws_iam_role.forwarder.id
+  policy = data.aws_iam_policy_document.forwarder_policy.json
+}

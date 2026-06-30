@@ -78,6 +78,10 @@ class Config:
     idempotency_table: str = _env("CDO_IDEMPOTENCY_TABLE", "cdo-idempotency-dev")
     idempotency_ttl_seconds: int = _env_int("CDO_IDEMPOTENCY_TTL_S", 86400)  # 24h
     audit_bucket: str = _env("CDO_AUDIT_BUCKET", "")  # rỗng → audit chỉ ra stdout (dev)
+    # SQS telemetry buffer (telemetry-contract §2.5.C). Rỗng → executor dùng watcher poll K8s (fallback).
+    telemetry_queue_url: str = _env("CDO_TELEMETRY_QUEUE_URL", "")
+    sqs_wait_time_s: int = _env_int("CDO_SQS_WAIT_S", 20)       # long-poll
+    sqs_max_messages: int = _env_int("CDO_SQS_MAX_MSGS", 10)    # batch ReceiveMessage
 
     # --- Pod Status Watcher (Option 1 telemetry collector) ---
     poll_interval_s: int = _env_int("CDO_POLL_INTERVAL_S", 30)

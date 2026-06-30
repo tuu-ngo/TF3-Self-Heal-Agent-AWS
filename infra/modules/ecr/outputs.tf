@@ -6,3 +6,8 @@ output "repository_url" {
 output "repository_name" {
   value = aws_ecr_repository.executor.name
 }
+
+output "forwarder_repository_url" {
+  description = "ECR repo URL cho image Alert Forwarder (forwarder/Dockerfile)"
+  value       = aws_ecr_repository.forwarder.repository_url
+}

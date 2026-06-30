@@ -48,7 +48,9 @@ module "secrets" {
   source = "../../modules/secrets"
 }
 
-# kyverno + argocd dùng helm provider — apply sau khi EKS tồn tại (phase 2)
+# kyverno + argocd + monitoring dùng helm provider — apply sau khi EKS tồn tại (phase 2).
+# Bật: (1) thay providers.tf bằng providers_phase2.tf (provider trỏ cluster thật),
+#      (2) bỏ comment 3 module dưới, (3) terraform init && apply.
 # module "kyverno" {
 #   source = "../../modules/kyverno"
 #   depends_on = [module.eks]
@@ -58,4 +60,10 @@ module "secrets" {
 #   source      = "../../modules/argocd"
 #   environment = var.environment
 #   depends_on  = [module.eks]
+# }
+#
+# module "monitoring" {
+#   source                = "../../modules/monitoring"
+#   forwarder_webhook_url = "http://cdo-telemetry-forwarder.monitoring.svc.cluster.local:8080/alerts"
+#   depends_on            = [module.eks]
 # }

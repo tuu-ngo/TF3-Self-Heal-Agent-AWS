@@ -15,4 +15,5 @@ data:
   AWS_REGION: "us-east-1"
   CDO_IDEMPOTENCY_TABLE: "cdo-idempotency-dev"           # = terraform output dynamodb_table_name
   CDO_AUDIT_BUCKET: "cdo-audit-cdo-eks-cluster-dev-dev"  # = terraform output audit_bucket_name
+  CDO_TELEMETRY_QUEUE_URL: "REPLACE_WITH_SQS_QUEUE_URL"  # = terraform output sqs_queue_url (rỗng → fallback poll K8s)
   CDO_K8S_MOCK: "false"                                   # chạy K8s thật trong cluster

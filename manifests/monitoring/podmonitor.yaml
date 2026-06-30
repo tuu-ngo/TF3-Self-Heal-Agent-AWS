@@ -1,0 +1,26 @@
+# PodMonitor — scrape podinfo app metrics (/metrics :9898) cho HighLatencyP95 / HighErrorRate.
+# Pod podinfo có label app=checkout-svc (tenant-a) / notification-svc (tenant-b),
+# port container 9898 đã đặt tên "http" (k8s/04-workloads.yaml).
+#
+# Các alert hạ tầng (PodOOMKilled, ContainerCrashLooping, ImagePullBackOff, HighContainerMemory)
+# lấy từ kube-state-metrics + kubelet/cAdvisor mà chart kube-prometheus-stack tự scrape —
+# KHÔNG phụ thuộc PodMonitor này.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: cdo-podinfo
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames: ["tenant-a", "tenant-b"]
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["checkout-svc", "notification-svc"]
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

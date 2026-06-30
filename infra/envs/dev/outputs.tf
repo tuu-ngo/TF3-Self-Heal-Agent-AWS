@@ -38,6 +38,16 @@ output "ai_engine_role_arn" {
   value       = module.iam.ai_engine_role_arn
 }
 
+output "forwarder_role_arn" {
+  description = "IRSA role ARN for Alert Forwarder (annotate SA cdo-telemetry-forwarder @ monitoring)"
+  value       = module.iam.forwarder_role_arn
+}
+
+output "ecr_forwarder_url" {
+  description = "ECR repo URL cho image Alert Forwarder"
+  value       = module.ecr.forwarder_repository_url
+}
+
 output "ecr_executor_url" {
   description = "ECR repo URL cho image executor"
   value       = module.ecr.repository_url

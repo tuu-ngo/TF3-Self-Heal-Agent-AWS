@@ -31,6 +31,7 @@ from k8s_client import K8sClient
 from models import DetectResponse
 from pre_decide_gate import FlapTracker, evaluate
 from safety_gate import check as safety_check
+from sqs_source import SqsTelemetrySource
 
 
 class Executor:
@@ -218,28 +219,53 @@ class Executor:
 
 def watch_loop(cfg=CONFIG) -> None:
     """
-    Production mode: poll pod status mỗi CDO_POLL_INTERVAL_S giây → trigger heal loop.
-    Cooldown CDO_HEAL_COOLDOWN_S (default 5 phút) tránh trigger lại cùng deployment liên tục.
+    Production mode. Mỗi vòng:
+      [1] NGUỒN CHÍNH — drain SQS telemetry buffer (Forwarder ← Alertmanager đẩy vào),
+          gom theo (namespace,deployment) → handle_incident → ack message.
+      [2] FALLBACK — poll K8s pod-status (watcher Option-1) cho trường hợp SQS rỗng/lỗi
+          hoặc chưa cấu hình CDO_TELEMETRY_QUEUE_URL.
+    Cùng 1 cooldown map (CDO_HEAL_COOLDOWN_S) chống double-fire giữa 2 nguồn.
 
     Chạy: python main.py --watch
     """
     executor = Executor(cfg)
+    sqs = SqsTelemetrySource(cfg)
     cooldown: dict[str, float] = {}  # "ns/deployment" → monotonic time lần heal gần nhất
-    print(f"[watcher] poll={cfg.poll_interval_s}s "
-          f"cooldown={cfg.heal_cooldown_s}s "
-          f"namespaces={list(cfg.tenant_namespaces)}")
+
+    def _cooled(key: str) -> bool:
+        return time.monotonic() - cooldown.get(key, 0.0) < cfg.heal_cooldown_s
+
+    src = "SQS(primary)+K8s-poll(fallback)" if sqs.enabled else "K8s-poll(only)"
+    print(f"[watch] source={src} poll={cfg.poll_interval_s}s "
+          f"cooldown={cfg.heal_cooldown_s}s namespaces={list(cfg.tenant_namespaces)}")
+
     while True:
-        now = time.monotonic()
+        # ---- [1] SQS telemetry buffer (nguồn chính theo contract) ----
+        for inc in sqs.drain():
+            key = f"{inc.namespace}/{inc.deployment}"
+            if _cooled(key):
+                print(f"[sqs] {key} trong cooldown, bỏ qua (vẫn ack)")
+                sqs.ack(inc)
+                continue
+            print(f"[sqs] incident {key} ({len(inc.telemetry_window)} signal)")
+            outcome = executor.handle_incident(inc.telemetry_window, inc.namespace)
+            print(f"[sqs] {key} → {outcome}")
+            cooldown[key] = time.monotonic()
+            sqs.ack(inc)
+
+        # ---- [2] Fallback: poll K8s pod-status ----
         for ev in W.collect_fault_events(executor.k8s, cfg.tenant_namespaces, cfg):
             key = f"{ev.namespace}/{ev.deployment}"
-            if now - cooldown.get(key, 0.0) < cfg.heal_cooldown_s:
-                print(f"[watcher] {key} trong cooldown, bỏ qua")
+            if _cooled(key):
                 continue
             print(f"[watcher] phát hiện {ev.suspected_fault_type} tại {key}")
             outcome = executor.handle_incident(ev.telemetry_window, ev.namespace)
             print(f"[watcher] {key} → {outcome}")
             cooldown[key] = time.monotonic()
-        time.sleep(cfg.poll_interval_s)
+
+        # SQS long-poll đã chờ sẵn; chỉ sleep thêm khi không dùng SQS để tránh busy-loop.
+        if not sqs.enabled:
+            time.sleep(cfg.poll_interval_s)
 
 
 def main() -> None:

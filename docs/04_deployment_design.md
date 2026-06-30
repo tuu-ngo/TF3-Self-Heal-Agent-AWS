@@ -378,9 +378,11 @@ CDO executor chỉ được write vào `manifests/<tenant>/` của chính tenant
 |---|---|
 | 0 | Namespace `platform`, `tenant-a`, `tenant-b`, `self-heal-system`; baseline labels/annotations |
 | 1 | RBAC, ServiceAccounts, IRSA bindings, configmaps; NetworkPolicy (allow-executor-to-ai) |
-| 2 | Observability stack: Prometheus, Alertmanager, Grafana |
-| 3 | CDO executor, telemetry collector; AI Engine Deployment + HPA (sau khi AI team bàn giao OCI image) |
+| 2 | Observability: kube-prometheus-stack (ns `monitoring`) + Alert Forwarder + PrometheusRule + PodMonitor + Grafana dashboard |
+| 3 | CDO executor (đọc SQS); AI Engine Deployment + HPA (sau khi AI team bàn giao OCI image) |
 | 4 | Tenant sample workloads và test scenarios |
+
+> Telemetry pipeline (Prometheus→Alertmanager→Forwarder→SQS→Executor) chi tiết deploy: `09_deploy_runbook_live.md`. Forwarder IRSA `cdo-forwarder-irsa` chỉ `sqs:SendMessage`.
 
 ### 3.9 Drift detection
 

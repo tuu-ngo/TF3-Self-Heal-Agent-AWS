@@ -1,0 +1,47 @@
+# Grafana dashboard "CDO Self-Heal" — Grafana sidecar (bật trong Helm values) tự nạp
+# ConfigMap có label grafana_dashboard. Panel: pod restarts, OOM, memory % theo tenant.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cdo-selfheal-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  cdo-selfheal.json: |
+    {
+      "title": "CDO Self-Heal — Tenants",
+      "uid": "cdo-selfheal",
+      "schemaVersion": 39,
+      "timezone": "utc",
+      "time": { "from": "now-3h", "to": "now" },
+      "refresh": "30s",
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Container restarts (tenant-*)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "targets": [
+            { "expr": "sum by (namespace,pod) (increase(kube_pod_container_status_restarts_total{namespace=~\"tenant-.+\"}[10m]))",
+              "legendFormat": "{{namespace}}/{{pod}}" }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "OOMKilled (last 1h)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "targets": [
+            { "expr": "sum(increase(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",namespace=~\"tenant-.+\"}[1h]))" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Memory usage % of limit",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+          "targets": [
+            { "expr": "100 * container_memory_working_set_bytes{container!=\"\",namespace=~\"tenant-.+\"} / on(namespace,pod,container) kube_pod_container_resource_limits{resource=\"memory\",namespace=~\"tenant-.+\"}",
+              "legendFormat": "{{namespace}}/{{pod}}/{{container}}" }
+          ]
+        }
+      ]
+    }

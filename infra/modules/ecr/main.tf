@@ -31,3 +31,35 @@ resource "aws_ecr_lifecycle_policy" "executor" {
     }]
   })
 }
+
+# ECR repo cho Alert Forwarder (build từ forwarder/Dockerfile).
+resource "aws_ecr_repository" "forwarder" {
+  name                 = "cdo-forwarder"
+  image_tag_mutability = "IMMUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  force_delete = true
+}
+
+resource "aws_ecr_lifecycle_policy" "forwarder" {
+  repository = aws_ecr_repository.forwarder.name
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Giữ 10 image mới nhất"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = { type = "expire" }
+    }]
+  })
+}

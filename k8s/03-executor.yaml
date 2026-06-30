@@ -31,6 +31,9 @@ spec:
               value: "cdo-idempotency-dev"
             - name: CDO_TENANT_NAMESPACES
               value: "tenant-a,tenant-b"
+            # Nguồn telemetry chính (SQS buffer ← Forwarder). Rỗng → fallback poll K8s 30s.
+            - name: CDO_TELEMETRY_QUEUE_URL
+              value: REPLACE_WITH_SQS_QUEUE_URL
           resources:
             requests:
               cpu: "100m"

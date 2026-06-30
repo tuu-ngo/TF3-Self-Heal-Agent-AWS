@@ -1,0 +1,19 @@
+# Chỉ cho phép pod trong ns monitoring (Alertmanager) gọi Forwarder :8080.
+# Forwarder egress 443 (SQS) không bị giới hạn ở đây (mặc định cho phép egress).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-alertmanager-to-forwarder
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app: cdo-telemetry-forwarder
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}        # mọi pod trong ns monitoring (gồm Alertmanager)
+      ports:
+        - protocol: TCP
+          port: 8080

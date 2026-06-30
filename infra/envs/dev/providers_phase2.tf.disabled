@@ -1,0 +1,75 @@
+# =============================================================================
+# PROVIDERS — PHASE 2 (sau khi EKS ACTIVE). KHÔNG tự load (đuôi .disabled).
+# =============================================================================
+# Cách bật phase-2 (kyverno + argocd + monitoring qua Helm):
+#   1. cd infra/envs/dev
+#   2. mv providers.tf providers_phase1.tf.bak
+#   3. mv providers_phase2.tf.disabled providers.tf
+#   4. Bỏ comment module "kyverno" / "argocd" / "monitoring" trong main.tf
+#   5. terraform init -reconfigure && terraform apply
+#
+# Khác phase-1: kubernetes/helm provider TRỎ THẬT vào cluster qua data source EKS
+# (thay vì dummy https://localhost). Data source chỉ resolve được khi cluster đã tồn tại.
+# =============================================================================
+
+terraform {
+  required_version = ">= 1.10"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.0"
+    }
+  }
+
+  backend "s3" {
+    bucket       = "cdo-tf-state-012619468490-dev"
+    key          = "envs/dev/terraform.tfstate"
+    region       = "us-east-1"
+    use_lockfile = true
+    encrypt      = true
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+
+  default_tags {
+    tags = {
+      Project     = "tf3-cdo-02"
+      Environment = var.environment
+      ManagedBy   = "terraform"
+    }
+  }
+}
+
+# Cluster thật — chỉ resolve được khi EKS đã ACTIVE (phase 2)
+data "aws_eks_cluster" "this" {
+  name = var.cluster_name
+}
+
+data "aws_eks_cluster_auth" "this" {
+  name = var.cluster_name
+}
+
+provider "kubernetes" {
+  host                   = data.aws_eks_cluster.this.endpoint
+  cluster_ca_certificate = base64decode(data.aws_eks_cluster.this.certificate_authority[0].data)
+  token                  = data.aws_eks_cluster_auth.this.token
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = data.aws_eks_cluster.this.endpoint
+    cluster_ca_certificate = base64decode(data.aws_eks_cluster.this.certificate_authority[0].data)
+    token                  = data.aws_eks_cluster_auth.this.token
+  }
+}

@@ -435,6 +435,20 @@ Observability là phần giúp AI và CDO hiểu chuyện gì đang xảy ra tro
 
 AI cần các dữ liệu này để detect/decide/verify. CDO cần các dữ liệu này để chứng minh action đã xử lý lỗi thật hay chưa.
 
+### 9.0 Telemetry pipeline (đã implement, telemetry-contract §2.5.C)
+
+```text
+podinfo/nodes/kube-state-metrics → Prometheus (kube-prometheus-stack, ns monitoring)
+   → PrometheusRule fire → Alertmanager → webhook → Alert Forwarder (forwarder/)
+   → chuẩn hóa telemetry signal → Amazon SQS (cdo-telemetry-dev, đã có)
+   → Executor SQS consumer (executor/sqs_source.py) → handle_incident (/v1/detect…)
+Grafana: dashboard cluster-health/OOM/restarts (datasource Prometheus).
+```
+
+- **Nguồn chính**: SQS (Forwarder ← Alertmanager). **Fallback**: Executor poll K8s pod-status 30s (`watcher.py`) khi SQS rỗng/lỗi.
+- **Cadence hybrid** đúng contract §5: event nguy cấp real-time (OOM/unhealthy), metric định kỳ (memory/restart 15s, latency/error cửa sổ 1 phút).
+- Deploy: `infra/modules/monitoring` (Helm phase-2) + `manifests/monitoring/*` + `manifests/forwarder/*`. Chi tiết: `09_deploy_runbook_live.md`.
+
 Telemetry theo contract AI (12 signals, 4 lớp):
 
 | Signal | Lớp | Source dự kiến | Trigger action |

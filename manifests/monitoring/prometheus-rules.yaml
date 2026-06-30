@@ -1,0 +1,85 @@
+# PrometheusRule — alert cho known patterns. alertname KHỚP forwarder/alert_map.py
+# (→ telemetry signal enum) và docs/06_runbook_library.md §3/§4.
+# Mỗi alert mang labels namespace/pod/container để forwarder định tuyến tenant + dựng telemetry.
+# annotations.value = giá trị metric (forwarder đọc làm telemetry value khi là số).
+#
+# Lưu ý: expr/threshold dựa trên kube-state-metrics + podinfo metrics — tinh chỉnh lại
+# theo dữ liệu cluster thật nếu cần. Mapping alertname→signal là phần đã unit-test.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cdo-selfheal-rules
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack   # để Prometheus của chart nhặt rule
+spec:
+  groups:
+    - name: cdo-selfheal.known-patterns
+      rules:
+        # R1 — OOM → pod_oom_event
+        - alert: PodOOMKilled
+          expr: kube_pod_container_status_last_terminated_reason{reason="OOMKilled", namespace=~"tenant-.+"} == 1
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            description: "OOMKilled: Pod {{ $labels.pod }}, Container {{ $labels.container }}, Exit Code 137"
+
+        # R2/R3 — CrashLoopBackOff → container_restart_count (value = số restart 10m)
+        - alert: ContainerCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total{namespace=~"tenant-.+"}[10m]) > 3
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            value: "{{ $value | printf \"%.0f\" }}"
+            description: "Container {{ $labels.container }} của pod {{ $labels.pod }} restart {{ $value | printf \"%.0f\" }} lần/10m"
+
+        # R3 — ImagePullBackOff/bad deploy → service_unhealthy
+        - alert: ImagePullBackOff
+          expr: kube_pod_container_status_waiting_reason{reason=~"ImagePullBackOff|ErrImagePull", namespace=~"tenant-.+"} == 1
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            description: "ImagePullBackOff: Pod {{ $labels.pod }} không pull được image"
+
+        # R1 — Memory cao tiệm cận limit → container_resource_usage (value = bytes)
+        - alert: HighContainerMemory
+          expr: |
+            (
+              container_memory_working_set_bytes{container!="", namespace=~"tenant-.+"}
+              / on(namespace,pod,container) group_left
+              kube_pod_container_resource_limits{resource="memory", namespace=~"tenant-.+"}
+            ) > 0.9
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            value: "{{ $value | printf \"%.0f\" }}"
+            description: "Container {{ $labels.container }} dùng > 90% memory limit"
+
+        # R2 — latency p95 cao → service_latency_p95 (value = ms)
+        - alert: HighLatencyP95
+          expr: |
+            histogram_quantile(0.95,
+              sum by (namespace, app, le) (rate(http_request_duration_seconds_bucket{namespace=~"tenant-.+"}[5m]))
+            ) * 1000 > 800
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            value: "{{ $value | printf \"%.1f\" }}"
+            description: "p95 latency {{ $value | printf \"%.0f\" }}ms vượt 800ms"
+
+        # R2 — error rate cao → service_error_rate (value = tỷ lệ 0..1)
+        - alert: HighErrorRate
+          expr: |
+            sum by (namespace, app) (rate(http_requests_total{namespace=~"tenant-.+", status=~"5.."}[5m]))
+            / sum by (namespace, app) (rate(http_requests_total{namespace=~"tenant-.+"}[5m])) > 0.05
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            value: "{{ $value | printf \"%.3f\" }}"
+            description: "Error rate {{ $value | printf \"%.1%\" }} vượt 5%"

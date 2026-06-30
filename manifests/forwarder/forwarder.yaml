@@ -1,0 +1,74 @@
+# Alert Forwarder — Alertmanager webhook → SQS (telemetry-contract §2.5.C).
+# Namespace monitoring (cạnh Alertmanager). IRSA chỉ sqs:SendMessage (least-privilege).
+# Placeholder điền sau `terraform output`: forwarder_role_arn, ecr_forwarder_url, sqs_queue_url.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cdo-telemetry-forwarder
+  namespace: monitoring
+  annotations:
+    eks.amazonaws.com/role-arn: REPLACE_WITH_FORWARDER_ROLE_ARN
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cdo-telemetry-forwarder
+  namespace: monitoring
+  labels:
+    app: cdo-telemetry-forwarder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cdo-telemetry-forwarder
+  template:
+    metadata:
+      labels:
+        app: cdo-telemetry-forwarder
+    spec:
+      serviceAccountName: cdo-telemetry-forwarder
+      containers:
+        - name: forwarder
+          image: REPLACE_WITH_FORWARDER_ECR_URL:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: CDO_TELEMETRY_QUEUE_URL
+              value: REPLACE_WITH_SQS_QUEUE_URL
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: CDO_TENANT_ID
+              value: "6c8b4b2b-4d45-4209-a1b4-4b532d56a31c"
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "200m", memory: "128Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cdo-telemetry-forwarder
+  namespace: monitoring
+  labels:
+    app: cdo-telemetry-forwarder
+spec:
+  type: ClusterIP
+  selector:
+    app: cdo-telemetry-forwarder
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
