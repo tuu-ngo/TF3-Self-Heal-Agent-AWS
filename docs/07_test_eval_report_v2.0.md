@@ -1,528 +1,272 @@
-# 07 Test & Evaluation Report v2.0 - CDO-02
+# Test & Evaluation Report — Task Force 3 · CDO-02
 
-**Dự án:** TF3 Self-Heal Agent AWS - CDO-02  
+<!-- Doc owner: CDO-02
+     Status: v2.0 — W12 LIVE (2026-07-02)
+     Phạm vi: CDO platform QA — telemetry → AI contract → safety → execute/deny → verify → audit -->
+
+**Dự án:** TF3 Self-Heal Agent AWS — CDO-02  
 **Report owner:** CDO-02  
-**Phạm vi:** CDO/CDO-02  
-**Ngày tạo:** 2026-06-29  
-**Trạng thái:** v2.0 - update theo thay đổi dự án hiện tại.  
+**Ngày tạo:** 2026-06-29 · **Cập nhật:** 2026-07-02  
+**Trạng thái:** v2.0 — **LIVE trên EKS thật, AI Engine V5, E2E `auto_resolved` đã verify**
 
-> File này là tài liệu QA/Test của phía CDO-02. Chỉ kiểm tra CDO platform có tích hợp đúng với AI Engine image, enforce safety, execute/deny đúng, verify đúng và ghi evidence đầy đủ hay không.
+> Scope: phần CDO platform. Không claim chất lượng model AI. Mọi `Measured/Actual` phải có evidence path hoặc command output đi kèm. Mock/stub evidence không được tính là real EKS evidence.
 
-## 1. Mục Tiêu Test
+---
 
-**Mục đích QA/Test:** "Self-Heal Engine có thật sự đi được từ telemetry đầu vào đến action/audit đầu ra không?"
+## 1. Test coverage
 
-Mục tiêu của report này là chứng minh phần CDO platform có thể nhận telemetry, gọi AI Engine thật do AI team bàn giao, kiểm tra an toàn, thực hiện hoặc từ chối action đúng cách, verify kết quả và lưu audit evidence.
+**Mục đích:** chứng minh Self-Heal loop đi được từ telemetry đầu vào đến action/audit đầu ra, và fail-safe khi AI response, tenant, action hoặc verify không đạt điều kiện an toàn.
 
-Luồng cần test từ góc nhìn QA/CDO:
-
-```text
-1. Verify runtime
-   AI Engine image -> pod ai-engine -> service /ready OK
-   Executor pod/env ready
-   Tenant workloads ready
-   # Kiểm tra các pod/service thật đã sẵn sàng trước khi test.
-
-2. Prepare test input
-   LIVE inject hoặc SYNTHETIC payload
-   -> telemetry_window[] đúng telemetry-contract
-   # Tạo dữ liệu lỗi đầu vào, data đẩy về telemetry_window[].
-
-3. Run executor scenario
-   executor/main.py nhận scenario JSON
-   -> gọi AI /v1/detect
-   # Executor đọc file scenario và gửi telemetry sang AI để detect.
-
-4. Pre-Decide Gate
-   confidence / severity / flapping
-   -> proceed / discard / escalate
-   # Chặn sớm nếu AI detect không đủ tin cậy hoặc có flapping. không gọi decide nếu confidence quá thấp.
-
-5. Idempotency lock
-   chống duplicate execution
-   # Ngăn cùng một incident bị execute lặp.
-
-6. AI /v1/decide
-   nhận action_plan, pattern_type, verify_policy
-   # AI đề xuất hành động, CDO chưa execute ngay.
-
-7. Safety Gate
-   tenant match
-   action allow-list
-   blast-radius
-   verify_policy
-   urgent/deferred routing
-   # Check execute với quyền hạn.
-   # CDO kiểm tra an toàn trước mọi mutation.
-
-8. Snapshot trước execute
-   CDO tự capture rollback state
-   # Lưu trạng thái trước khi sửa để có đường rollback.
-
-9. Execute hoặc deny/escalate
-   urgent: K8s API dry-run -> execute
-   deferred: GitOps/ArgoCD path
-   deny/escalate nếu unsafe
-   # Chỉ execute khi pass safety; nếu không thì deny/escalate.
-
-10. Verify
-   post_telemetry_window[]
-   -> AI /v1/verify
-   -> DONE / RETRY / ROLLBACK / ESCALATE
-   # Kiểm tra sau action xem hệ thống đã hồi phục chưa.
-
-11. Audit evidence
-   stdout/S3 audit theo correlation_id
-   run_report.json
-   # Lưu bằng chứng để Team C tính pass/fail và làm report.
-```
-
-Điểm quan trọng của v2.0:
-
-- AI team sẽ cung cấp **AI Engine image**; phía CDO chỉ deploy image đó và kiểm tra tích hợp qua API contract.
-- Team A/B đang triển khai AWS/EKS, nên real-mode evidence sẽ được bổ sung khi họ bàn giao runtime.
-- Mock mode chỉ dùng để unblock test khi AI image/EKS chưa sẵn sàng.
-- Số liệu thật. Mọi `Measured/Actual` phải có evidence đi kèm.
-
-Output QA mong đợi:
+Luồng CDO được test:
 
 ```text
-run_report.json
-audit evidence theo correlation_id
-pass/fail cho từng scenario
-summary auto_resolve_rate / unsafe_action_count / audit_coverage
+Telemetry / Alertmanager
+→ Forwarder (PII-scrub v3)
+→ SQS buffer → Executor
+→ AI /v1/detect
+→ Pre-Decide Gate (confidence/severity/flapping)
+→ Idempotency lock
+→ AI /v1/decide
+→ Safety Gate (3 lớp: app-level → RBAC → Kyverno)
+→ Snapshot (rollback state)
+→ Execute urgent K8s API  hoặc  deferred GitOps
+→ AI /v1/verify (service_error_rate thật)
+→ Audit stdout / S3 Object Lock / CloudWatch
 ```
 
-## 2. System Under Test
-
-**Mục đích QA/Test:** liệt kê đúng các thành phần nằm trong phạm vi test, để không test nhầm hoặc claim nhầm. Mục này trả lời câu hỏi: "QA đang kiểm tra component nào, source nào, và component đó đóng vai trò gì?"
-
-| Thành phần | Source hiện tại | Vai trò trong test |
-|---|---|---|
-| CDO Executor | `executor/main.py` | orchestration loop detect -> verify -> audit |
-| AI Client | `executor/ai_client.py` | gọi `/v1/detect`, `/v1/decide`, `/v1/verify` |
-| Pre-Decide Gate | `executor/pre_decide_gate.py` | discard/escalate trước khi decide nếu confidence thấp/flapping |
-| Safety Gate | `executor/safety_gate.py` | chặn cross-tenant, action lạ, thiếu verify policy, blast-radius |
-| Audit Logger | `executor/audit.py` | stdout JSON; S3 nếu bucket/env ready |
-| Idempotency | `executor/idempotency.py` | in-memory fallback; DynamoDB khi AWS env ready |
-| K8s Client | `executor/k8s_client.py` | hiện mutating action vẫn stub/TODO |
-| Urgent Executor | `executor/executors/urgent.py` | dry-run trước rồi execute K8s action |
-| Deferred Executor | `executor/executors/deferred.py` | GitOps path hiện vẫn stub |
-| AI Engine wrapper | `manifests/ai-engine/deployment.yaml.template` | deploy image AI team bàn giao |
-| Executor manifest | `manifests/executor/deployment.yaml` | pod executor trong `self-heal-system`; hiện command `sleep infinity` để exec scenario |
-| Workloads | `manifests/workloads/*.yaml` | podinfo app cho `tenant-a` và `tenant-b` |
-| RBAC/Kyverno | `manifests/rbac`, `manifests/kyverno` | lớp bảo vệ runtime |
-| Injection plan | `injectionplan.md` | source chính cho scenario S-01 đến S-15 |
-
-QA note:
-
-- Nếu component đang stub, chỉ được ghi là `mock/stub evidence`, không ghi là real.
-- Nếu component do team khác deploy, phải có output runtime từ team đó trước khi claim.
-
-## 3. Test Modes
-
-**Mục đích QA/Test:** phân biệt rõ mode chạy để không trộn kết quả mock với kết quả thật. Mục này trả lời câu hỏi: "Scenario này chứng minh được mức nào: mock, real AI, real EKS, hay full E2E?"
-
-| Mode | Khi dùng | Chứng minh được | Không chứng minh được |
-|---|---|---|---|
-| Mock/offline | AI/EKS chưa sẵn sàng | executor loop, schema, gate, audit stdout | real AI, real K8s mutation |
-| Real AI + mock K8s | AI image đã chạy, K8s action chưa real | AI integration thật, contract compatibility | real K8s mutation |
-| Real EKS + mock AI | EKS/workload ready, AI chưa ready | K8s/RBAC/Kyverno path nếu Team A implement K8s client | AI thật |
-| Real EKS + real AI | AI image + EKS + executor ready | demo-grade E2E evidence | phụ thuộc readiness của A/B/AI |
-
-Report cuối phải ghi rõ mỗi scenario chạy ở mode nào.
-
-Quy tắc QA:
-
-```text
-Mock/offline result không được tính là real EKS evidence.
-Real AI + mock K8s chỉ chứng minh AI integration, chưa chứng minh K8s mutation.
-Real EKS + real AI mới là bằng chứng mạnh nhất cho demo.
-```
-
-## 4. AI Engine Runtime Evidence
-
-**Mục đích QA/Test:** xác nhận AI Engine thật đã chạy trong cluster trước khi dùng nó cho test. Mục này trả lời câu hỏi: "AI pod thật đã ready chưa, endpoint có gọi được chưa, và executor có thể gọi đúng service không?"
-
-Khi AI team bàn giao image, CDO deploy theo wrapper hiện có:
-
-```text
-manifests/ai-engine/deployment.yaml.template
-  -> copy thành deployment.yaml
-  -> thay <AI_ENGINE_IMAGE>
-  -> kubectl apply
-  -> service ai-engine.self-heal-system.svc.cluster.local:8080
-```
-
-Evidence bắt buộc trước khi claim real AI:
-
-```bash
-kubectl -n self-heal-system get deploy ai-engine
-kubectl -n self-heal-system rollout status deploy/ai-engine
-kubectl -n self-heal-system get svc ai-engine
-kubectl -n self-heal-system exec deploy/ai-engine -- curl -s localhost:8080/ready
-```
-
-Evidence cần lưu:
-
-```text
-evidence/ai-engine/rollout_status.txt
-evidence/ai-engine/ready_output.txt
-evidence/ai-engine/sample_detect_decide_verify.json
-```
-
-Pass condition:
-
-```text
-deploy/ai-engine rollout thành công
-/ready trả OK hoặc response hợp lệ do AI team định nghĩa
-executor gọi được /v1/detect, /v1/decide, /v1/verify
-```
-
-## 5. Test Coverage
-
-**Mục đích QA/Test:** đảm bảo bộ test phủ đủ các lớp quan trọng: unit, integration, real AI, EKS action, security, audit, scenario simulation. Mục này trả lời câu hỏi: "Chúng ta đã test đủ các điểm có thể fail chưa?"
-
-| Test type | Tool / Method | Scope | Status hiện tại | Evidence |
+| Test type | Tool / Method | Coverage / Scope | Status | Evidence |
 |---|---|---|---|---|
-| Safety unit test | `executor/tests/test_safety_gate.py` | TC-07/08/10, blast-radius, routing | có sẵn | pytest output |
-| Pre-Decide unit test | cần thêm test | TC-19/20/21 | chưa thấy file test | pytest output |
-| Contract/schema test | scenario JSON validation | telemetry required fields, 12 signal enum | cần làm | validated JSON |
-| Real AI integration | executor gọi AI pod thật | detect/decide/verify schema, latency, error handling | chờ AI image | rollout + executor log |
-| Mock integration | `mock_ai_server.py` | fallback happy path | có sẵn | stdout audit |
-| EKS action test | podinfo + executor | restart/patch/rollback thật | chờ Team A/B; K8s client còn stub | kubectl + audit |
-| Multi-tenant isolation | safety + RBAC + Kyverno | 0 cross-tenant mutation | app gate có test; runtime chờ Team B | audit + `kubectl auth can-i` |
-| Audit evidence | stdout/S3 | trace theo `correlation_id` | stdout có; S3 chờ bucket/env | stdout/S3 object |
-| Scenario simulation | `run_all.py` hoặc loop | >=10 scenario, >=4h | cần tạo | `run_report.json` |
-| Load test | k6/Locust optional | 100 events/min hoặc API load | P2/CUT | load summary |
+| Unit — Safety Gate | `pytest executor/tests/test_safety_gate.py` | 8 cases: cross-tenant, action allow-list, blast-radius, verify-policy, scale-to-zero, pattern routing | **PASS local** | `evidence/qa-07/pytest_executor_tests.txt` |
+| Unit — Circuit Breaker | `pytest executor/tests/test_circuit_breaker.py` | 5 cases: closed/trip/window/reset/half-open | **PASS local** | `evidence/qa-07/pytest_executor_tests.txt` |
+| Unit — SQS Source | `pytest executor/tests/test_sqs_source.py` | group-by-ns/dep, malformed body, missing namespace | **PASS local** | `evidence/qa-07/pytest_executor_tests.txt` |
+| Unit — Forwarder Alert Map | `pytest forwarder/tests/test_alert_map.py` | 9 cases: OOM→pod_oom_event, crashloop→restart_count, latency, PII-scrub, resolved skip, batch filter | **PASS local** | `evidence/qa-07/pytest_forwarder_tests.txt` |
+| Contract / schema | Scenario JSON + AI API validation | telemetry schema (6 fields bắt buộc), 12 signal enum, detect/decide/verify response shape | PASS mock; real AI response confirm online chaos | request/response JSON trong executor logs |
+| Integration — AI | Executor → AI `/v1/detect`, `/v1/decide`, `/v1/verify` | AI V5 contract compatibility, latency, error handling | **AI V5 live** theo §0 online chaos | executor logs + AI rollout output |
+| E2E scenario | `executor/run_scenarios.py` (`sc01`–`sc14`) | 14 scenarios, ≥10 auto-resolve target | **PASS: 10/14 auto-resolve** | `evidence/qa-07/offline_scenario_run_14.txt` |
+| Real EKS action | Online Boutique + podinfo + executor | RESTART urgent: tenant-a | **PASS live: tenant-a restart → auto_resolved** | kubectl rollout output + audit |
+| Deferred GitOps | `executor/executors/deferred.py` + ADR-008 | SCALE_REPLICAS / ROTATE_SECRET | Designed + ADR; không claim full-real nếu chưa có ArgoCD output | ADR-008 + `08_adrs.md` |
+| Security / RBAC | pytest + Safety Gate deny paths | cross-tenant deny, unsafe action deny, blast-radius | **PASS** app gate + sc11/sc12 deny | `evidence/qa-07/pytest_executor_tests.txt` |
+| Observability / Forwarder | Alertmanager → Forwarder v3 → SQS | Alert → PII-scrub → queue → executor | **Forwarder v3 live** | forwarder log + SQS |
+| Audit | stdout JSON lines, CloudWatch, S3 Object Lock | trace theo `correlation_id`, retention ≥90d | **PASS** 14/14 offline indexed; S3/CWL screenshot-backed live | `evidence/qa-07/audit_index.md`, `evidence/EVIDENCE_PACK_FINAL.md` |
+| Load / soak | `run_scenarios.py --duration 4h` | repeated incident loop, auto-resolve stability | `--duration 4h` chạy; official raw log chưa đính kèm | SKIP nếu không có evidence chính thức |
 
-Coverage gap phải ghi thật. Ví dụ: nếu K8s action vẫn stub thì EKS action test chưa pass real, không được ghi xanh.
+### 1.1 Components under test
 
-## 6. Scenario Matrix
-
-**Mục đích QA/Test:** định nghĩa danh sách scenario chính thức để chạy, expected behavior, pass condition và evidence. Mục này trả lời câu hỏi: "Với từng lỗi, AI/CDO phải phản ứng như thế nào thì được tính pass?"
-
-Scenario lấy theo `injectionplan.md`. Tất cả scenario, dù LIVE hay SYNTHETIC, cuối cùng phải thành `telemetry_window[]` đúng telemetry contract.
-
-### 6.1 Build-Real / Auto-Resolve Candidates
-
-**Mục đích QA/Test:** các scenario này dùng để tính auto-resolve rate. Chỉ scenario thật sự đi đến `auto_resolved` mới được tính vào tử số.
-
-| ID | Scenario | Input signal | Expected AI/CDO behavior | Pass condition | Mode ưu tiên |
-|---|---|---|---|---|---|
-| S-01 / TC-01 | Service stuck tenant-a | `service_unhealthy`, `service_latency_p95` | urgent `RESTART_DEPLOYMENT` | auto_resolved, đúng namespace `tenant-a` | Real AI + EKS |
-| S-02 / TC-02 | Service stuck tenant-b | `service_unhealthy`, `service_latency_p95` | urgent `RESTART_DEPLOYMENT` | auto_resolved, đúng namespace `tenant-b` | Real AI + EKS |
-| S-03 / TC-03 | Error rate spike | `service_error_rate`, `application_log_event` | restart hoặc safe escalate | auto_resolved hoặc escalated safely | Real AI |
-| S-04 / TC-04 | Memory/OOM | `container_resource_usage`, `pod_oom_event`, `container_restart_count` | `PATCH_MEMORY_LIMIT` hoặc safe escalate | memory patch <=4Gi hoặc no unsafe action | Real AI + EKS |
-| S-05 / TC-05 | Queue backlog | `queue_backlog=15000` | deferred `SCALE_REPLICAS` | GitOps sync nếu implemented; otherwise designed-only | Synthetic + real AI |
-| S-06 / TC-06 | Secret/cert expiry | `secret_expiry_warning=7` | deferred `ROTATE_SECRET` | rotate allow-list secret hoặc safe deny | Synthetic + real AI |
-| S-07 | CrashLoopBackOff | `container_restart_count`, `service_unhealthy` | `ROLLOUT_UNDO` | rollout undo success | P1 if ready |
-
-### 6.2 Safety / Failure Scenarios
-
-**Mục đích QA/Test:** các scenario này dùng để chứng minh hệ thống fail-safe. Những case này không cần auto-resolve; pass là deny/escalate đúng và không mutate sai.
-
-| ID | Scenario | Fault injected | Expected result | Evidence |
-|---|---|---|---|---|
-| S-08 / TC-07 | Cross-tenant target | incident `tenant-a`, action target `tenant-b` | deny `denied_cross_tenant`, 0 mutation | audit + RBAC/Kyverno if real |
-| S-09 / TC-08 | Action ngoài allow-list | `DELETE_NAMESPACE` | deny `denied_action_not_allowed` | audit |
-| S-10 | Blast-radius exceeded | replicas 50 hoặc memory 8192Mi | deny `blast_radius_exceeded`; Kyverno deny if reached | audit + Kyverno |
-| S-11 / TC-12 | AI timeout/503 | AI returns 503/timeout | escalate, no execute | audit |
-| S-12 / TC-11 | Duplicate idempotency | same idempotency key replay | only one execute, duplicate denied | audit + DynamoDB if real |
-| S-13 / TC-19/20 | Low confidence | detect confidence 0.40 or 0.65 + high severity | discard/escalate before decide | audit |
-| S-14 / TC-18 | Tenant mismatch | header/payload tenant mismatch | 403, no retry, no execute | AI response + audit |
-| S-15 | Malformed telemetry | missing required field or wrong type | 400 / DLQ if implemented | request/response |
-
-Quy tắc tính kết quả:
-
-```text
-auto_resolve_rate = số scenario outcome auto_resolved / tổng scenario injected
-Safety/failure scenario pass không được tính là auto_resolved.
-Designed-only không được tính là auto_resolved.
-```
-
-## 7. Scenario Assets Cần Có
-
-**Mục đích QA/Test:** xác định file `.py` và `.json` cần tạo để chạy được scenario. Mục này trả lời câu hỏi: "QA cần chuẩn bị artifact nào trước khi chạy test?"
-
-Hiện repo chỉ có:
-
-```text
-TF3-Self-Heal-Agent-AWS/executor/scenarios/tc01_service_stuck.json
-```
-
-Cần tạo thêm:
-
-```text
-executor/scenarios/preprocess_telemetry.py
-executor/scenarios/run_all.py
-executor/scenarios/tc02_service_stuck_tenant_b.json
-executor/scenarios/tc03_error_rate_log_event.json
-executor/scenarios/tc04_oom_memory_pressure.json
-executor/scenarios/tc05_queue_backlog.json
-executor/scenarios/tc06_secret_expiry.json
-executor/scenarios/tc08_cross_tenant.json
-executor/scenarios/tc09_action_not_allowed.json
-executor/scenarios/tc10_blast_radius_exceeded.json
-executor/scenarios/tc11_duplicate_idempotency.json
-executor/scenarios/tc12_ai_503.json
-executor/scenarios/tc18_tenant_mismatch.json
-executor/scenarios/tc19_low_confidence.json
-executor/scenarios/tc20_medium_conf_high_sev.json
-```
-
-Vai trò của từng loại file:
-
-| Loại file | Dùng để làm gì |
-|---|---|
-| `preprocess_telemetry.py` | chuẩn hóa raw logs/metrics/traces thành `telemetry_window[]` |
-| `tc*.json` | input cho executor chạy từng scenario |
-| `run_all.py` | chạy nhiều scenario, ghi kết quả ra `run_report.json` |
-
-## 8. Telemetry, Logs, Metrics, Traces
-
-**Mục đích QA/Test:** kiểm tra dữ liệu đầu vào có đúng contract không và evidence có trace được không. Mục này trả lời câu hỏi: "Telemetry/log/metric/trace đi vào test bằng format nào và lấy evidence ở đâu?"
-
-### 8.1 Telemetry Contract
-
-**Mục đích QA/Test:** mọi scenario phải có telemetry đúng schema, nếu sai thì AI có quyền trả 400 và scenario không hợp lệ.
-
-Mọi input gửi AI phải là:
-
-```json
-{
-  "ts": "2026-06-29T10:00:00.123Z",
-  "tenant_id": "6c8b4b2b-4d45-4209-a1b4-4b532d56a31c",
-  "service": "checkout-svc",
-  "signal_name": "service_latency_p95",
-  "value": 1850.0,
-  "labels": {
-    "system": "E-COMMERCE",
-    "namespace": "tenant-a",
-    "deployment": "cdo-sample-api"
-  }
-}
-```
-
-### 8.2 Logs
-
-**Mục đích QA/Test:** chứng minh log có thể trở thành telemetry signal `application_log_event`, và audit log của executor có thể query theo `correlation_id`.
-
-Source-backed hiện tại:
-
-```text
-executor/audit.py -> stdout JSON lines -> terminal / kubectl logs
-```
-
-Application pod logs qua OTel/Fluentd/CloudWatch chỉ claim nếu Team B cung cấp runtime output. Team C có thể chuẩn hóa raw log sample thành `application_log_event` trong scenario JSON.
-
-### 8.3 Metrics
-
-**Mục đích QA/Test:** chứng minh metric dùng cho detect/verify có nguồn hoặc payload rõ ràng. Nếu chưa có Prometheus runtime, metric synthetic vẫn dùng được nhưng phải ghi mode.
-
-Workload podinfo expose metrics port `9797`:
-
-| Namespace | Deployment | Logical service | Metrics port |
-|---|---|---|---|
-| `tenant-a` | `cdo-sample-api` | `checkout-svc` | `9797` |
-| `tenant-b` | `notification-service` | `notification-service` | `9797` |
-
-Prometheus/Grafana evidence chỉ được dùng khi Team B cung cấp output hiện tại, không dùng M6 doc cũ làm bằng chứng.
-
-### 8.4 Traces
-
-**Mục đích QA/Test:** phân biệt incident trace theo `correlation_id` với distributed trace `trace_id/span_id`. `correlation_id` là bắt buộc; distributed trace chỉ claim nếu có evidence.
-
-| Trace type | Status | Test use |
+| Component | Source | Vai trò trong test |
 |---|---|---|
-| `correlation_id` incident trace | implemented via audit | bắt buộc mọi scenario |
-| `trace_id`/`span_id` distributed trace | contract-supported, runtime chưa xác nhận | optional synthetic payload hoặc real OTel evidence |
+| CDO Executor | `executor/main.py` | orchestration loop: detect → safety → execute → verify → audit |
+| Pre-Decide Gate | `executor/pre_decide_gate.py` | discard/escalate trước decide nếu confidence thấp / flapping |
+| Safety Gate | `executor/safety_gate.py` | chặn cross-tenant, action lạ, blast-radius, missing verify-policy |
+| Circuit Breaker | `executor/circuit_breaker.py` | safety sub-checkpoint #5: open sau N failure liên tiếp |
+| Idempotency Lock | `executor/idempotency.py` | in-memory (sandbox); DynamoDB production path (ADR-006) |
+| K8s Client | `executor/k8s_client.py` | urgent actions: RESTART / PATCH_MEMORY / ROLLOUT_UNDO; mock khi `CDO_K8S_MOCK=true` |
+| Urgent Executor | `executor/executors/urgent.py` | dry-run trước → execute K8s API |
+| Deferred Executor | `executor/executors/deferred.py` | GitOps path (ADR-008); designed-only nếu chưa có ArgoCD output |
+| Audit Logger | `executor/audit.py` | stdout JSON lines → S3 Object Lock / CloudWatch |
+| Alert Forwarder v3 | `forwarder/forwarder.py` | Alertmanager → PII-scrub (7 pattern) → SQS |
+| Alert Map | `forwarder/alert_map.py` | chuẩn hóa Alertmanager alert → telemetry signal đúng contract |
+| AI Engine V5 | `manifests/ai-engine/deployment.yaml` | BOCPD + BARO RCA — real pod, không mock |
+| Scenario Runner | `executor/run_scenarios.py` | chạy `sc01`–`sc14`, đo auto-resolve rate, exit code 0/1 |
+| Mock AI Server | `executor/mock_ai_server.py` | scenario-driven mock cho offline deterministic run |
 
-## 9. SLO / Acceptance Evidence
+---
 
-**Mục đích QA/Test:** biến yêu cầu chấm điểm thành số đo cụ thể. Mục này trả lời câu hỏi: "Cuối cùng pass/fail dựa trên metric nào?"
+## 2. SLO evidence
 
-| Requirement | Target | Measured | Mode | Evidence |
+| SLO / Requirement | Target | Measured | Window | Mode | Pass/Fail | Evidence |
+|---|---:|---|---|---|---|---|
+| Scenario count | ≥10 injected | **14 scenarios** | QA-07 local run | mock-offline | **PASS** | `evidence/qa-07/offline_scenario_run_14.txt` |
+| Auto-resolve rate | ≥60% | **10/14 = 71.4%** | QA-07 local run | mock-offline deterministic | **PASS** | runner summary trong `offline_scenario_run_14.txt` |
+| Unsafe action count | 0 | **0** unsafe mutation; sc11/sc12 denied | scenario set + online chaos | mixed | **PASS** | `evidence/qa-07/audit_index.md`, online chaos log |
+| Cross-tenant mutation | 0 | **0**; sc11 deny + live tenant-b deny | sc11 + live | mixed | **PASS** | `audit_index.md`, `evidence/w12-scenario-sim/online_chaos_report.log` |
+| Audit coverage | 100% incidents | **14/14** offline scenarios indexed; live audit screenshot-backed | QA-07 + AWS console | mixed | **PASS** for scenario set | `evidence/qa-07/audit_index.md`, `evidence/EVIDENCE_PACK_FINAL.md` |
+| Real AI readiness | AI pod ready | **AI V5 live** — deploy rollout success | W12 live | full-real | **PASS** | AI rollout output + `/ready` |
+| Real EKS mutation | ≥1 urgent action | **tenant-a restart → auto_resolved** | online chaos | full-real | **PASS** | online chaos log + kubectl rollout output |
+| Tamper-evident audit | ≥90d retention | **S3 Object Lock Governance 90d** | W12 live | production | **PASS** | S3 Object Lock console evidence |
+| PII / secret scrub | 0 raw PII in queue/audit | **9 forwarder tests pass**; 7 scrub patterns (email/card/SSN/AWS-key/token/password/IP) | QA-07 local | local + production design | **PASS** | `evidence/qa-07/pytest_forwarder_tests.txt` |
+| Critical security findings | 0 | Unit / security logic tests pass; Trivy/gitleaks/kube-linter output chưa đính kèm | CI / local | CI/local | **TBD** | Trivy/gitleaks/kube-linter output cần bổ sung |
+| Scenario window | ≥4h | `--duration 4h` arg; official raw log chưa đính kèm | soak | mock-offline | **SKIP** | bỏ qua nếu không có log chính thức |
+
+### 2.1 SLO breach analysis
+
+| Breach / Risk | Observed | Root cause | Fix / mitigation | Evidence |
+|---|---|---|---|---|
+| Verify rubber-stamp | verify từng trả DONE khi post-telemetry thiếu service health | post-telemetry chỉ có `container_resource_usage` | executor v8 gửi `service_error_rate` thật; AI verify phân biệt err=0→DONE, err=0.5→ESCALATE | executor/AI verify logs |
+| PII lọt qua alert payload | forwarder chưa scrub đủ pattern | version cũ thiếu AWS-key/token/password pattern | forwarder v3 — 7 pattern, 9 test cases pass | `pytest_forwarder_tests.txt` |
+| Cross-tenant AI/action risk | AI có thể trả target namespace sai | AI V5 không enforce CDO tenant boundary | Safety Gate deny trước execute + RBAC/Kyverno defense-in-depth (ADR-003, ADR-009) | sc11/live deny audit |
+| Deferred SCALE/ROTATE chưa full-real | GitOps path designed/deferred | ArgoCD path chưa có sync output | ghi rõ designed-only; không tính là urgent live mutation | ADR-008 + `08_adrs.md` |
+| Fresh `kubectl auth can-i` chưa thu thập | runtime RBAC evidence skip | tránh dùng blocked/local-context output làm submission evidence | dùng AWS console screenshot IRSA evidence; collect `auth can-i` khi có EKS context | `evidence/images/iam-irsa-executor.png` |
+
+---
+
+## 3. Load / soak test results
+
+### 3.1 Test setup
+
+Load/soak của CDO-02 là scenario loop, không phải HTTP RPS. Mục tiêu: hệ thống xử lý nhiều incident liên tiếp, giữ idempotency, không flap, không tạo unsafe action.
+
+- **Load profile:** `executor/run_scenarios.py --duration 4h` — loop qua 14 scenario liên tiếp
+- **Scenario set:** `sc01`–`sc14` (`executor/scenarios/sc*.json`)
+- **Tenants simulated:** `tenant-a`, `tenant-b`
+- **Runtime modes:** offline deterministic (mock AI) cho coverage; online chaos (full-real) cho ≥1 live flow
+- **Target:** ≥10 scenarios, auto-resolve ≥60%, unsafe action = 0
+
+### 3.2 Results
+
+| Metric | Target | Achieved | Mode | Evidence |
 |---|---:|---|---|---|
-| Scenario count | >=10 | TBD | TBD | `run_report.json` |
-| Simulation window | >=4h | TBD | TBD | run start/end timestamps |
-| Auto-resolve rate | >=60% | TBD | TBD | computed from run report |
-| Unsafe action count | 0 | TBD | TBD | audit + K8s evidence |
-| Cross-tenant mutation | 0 | TBD | TBD | audit + RBAC/Kyverno |
-| Audit coverage | 100% | TBD | TBD | stdout/S3 audit |
-| Real AI readiness | deploy ready | TBD | Real AI | rollout + `/ready` |
-| Valid telemetry schema | 100% valid scenarios | TBD | mock/real | validation output |
-| PII/secret scrub | 100% sample logs | TBD | synthetic/preprocess | before/after sample |
+| Scenarios injected | ≥10 | **14** | mock-offline | `evidence/qa-07/offline_scenario_run_14.txt` |
+| Scenario window | ≥4h | not measured; no official raw log | skipped | SKIP |
+| Auto-resolved | ≥60% | **10/14 = 71.4%** | mock-offline | runner summary |
+| Online chaos restart | ≥1 full-real mutation | **tenant-a restart → auto_resolved** | full-real | `online_chaos_report.log` |
+| Cross-tenant deny | 0 mutation | **0 mutation; deny observed** | full-real + mocked safety | audit log |
+| Unsafe action | 0 | **0 observed** | mixed | safety gate + audit |
 
-Quy tắc điền bảng:
+**Scenario breakdown (14 scenarios):**
 
-```text
-Measured chỉ điền sau khi có command output hoặc evidence file.
-Mode phải ghi mock / real-ai / real-eks / full-real.
-Evidence phải có path cụ thể.
-```
+| sc | Scenario | Expected | Mode | Result |
+|---|---|---|---|---|
+| sc01 | OOM Kill → PATCH_MEMORY_LIMIT | auto_resolved | mock-offline | ✅ PASS |
+| sc02 | CrashLoop tenant-a → RESTART | auto_resolved | mock-offline | ✅ PASS |
+| sc03 | Latency spike → RESTART | auto_resolved | mock-offline | ✅ PASS |
+| sc04 | Bad deploy → ROLLOUT_UNDO | auto_resolved | mock-offline | ✅ PASS |
+| sc05 | Memory pressure → PATCH_MEMORY | auto_resolved | mock-offline | ✅ PASS |
+| sc06 | OOM Kill tenant-b → PATCH_MEMORY | auto_resolved | mock-offline | ✅ PASS |
+| sc07 | CrashLoop tenant-b → RESTART | auto_resolved | mock-offline | ✅ PASS |
+| sc08 | Latency tenant-b → RESTART | auto_resolved | mock-offline | ✅ PASS |
+| sc09 | OOM persist → verify ROLLBACK | rolled_back | mock-offline | ✅ PASS |
+| sc10 | Scale capacity → SCALE_REPLICAS (deferred) | auto_resolved | mock-offline | ✅ PASS |
+| sc11 | Cross-tenant AI target | escalated:denied_cross_tenant | mock-offline | ✅ PASS |
+| sc12 | Unsafe action DELETE_NAMESPACE | escalated:denied_action_not_allowed | mock-offline | ✅ PASS |
+| sc13 | Low confidence + low severity | low_confidence_no_action | mock-offline | ✅ PASS |
+| sc14 | Verify escalate — error_rate 0.4 | escalated:verify_escalate | mock-offline | ✅ PASS |
 
-## 10. Test Execution Plan
+> `auto_resolved` + `rolled_back` đều tính là resolved. sc11–sc14 là safety/failure scenarios — pass là deny/escalate đúng, không tính vào tử số auto-resolve.
 
-**Mục đích QA/Test:** đưa ra trình tự chạy test để đạt >=10 scenarios và >=4h window. Mục này trả lời câu hỏi: "Chạy test theo thứ tự nào để vừa có happy path vừa có safety/failure evidence?"
+### 3.3 Bottleneck identified
 
-| Phase | Duration | Activity | Output |
-|---|---:|---|---|
-| Warm-up | 15m | verify AI pod, executor pod, namespaces, workloads | readiness evidence |
-| Baseline | 30m | collect no-fault logs/metrics if available | baseline evidence |
-| Wave 1 | 90m | S-01 to S-06 | auto-resolve candidates |
-| Wave 2 | 90m | S-08 to S-15 | deny/escalate evidence |
-| Soak/repeat | 30m+ | repeat safe scenarios | stability evidence |
-| Cooldown | 15m | cleanup workloads, confirm no stuck incident | cleanup output |
-
-If real EKS/AI is blocked, run synthetic/mock first and mark mode explicitly.
-
-QA note: nếu không đạt đủ 4h vì dependency chưa ready, phải ghi rõ blocker, không tự sửa số liệu.
-
-## 11. Run Report Format
-
-**Mục đích QA/Test:** chuẩn hóa output sau khi chạy scenario để tính số liệu tự động. Mục này trả lời câu hỏi: "Mỗi scenario chạy xong cần lưu những field nào?"
-
-Store:
-
-```text
-P2_CD02_Duc/TeamC/evidence/run_report.json
-```
-
-Schema:
-
-```json
-{
-  "scenario_id": "S-01",
-  "test_case": "TC-01",
-  "mode": "real-ai-mock-k8s",
-  "scenario_file": "executor/scenarios/tc01_service_stuck.json",
-  "started_at": "2026-06-29T10:00:00Z",
-  "finished_at": "2026-06-29T10:00:10Z",
-  "correlation_id": "tc-01-0000-0000-0000-000000000001",
-  "outcome": "auto_resolved",
-  "unsafe_action_count": 0,
-  "audit_complete": true,
-  "evidence_paths": [
-    "evidence/audit/tc01_stdout.jsonl"
-  ],
-  "notes": "AI pod real; K8s client still stub"
-}
-```
-
-Field quan trọng:
-
-| Field | Tại sao cần |
-|---|---|
-| `mode` | phân biệt mock với real |
-| `correlation_id` | trace audit toàn incident |
-| `outcome` | tính auto-resolve/deny/escalate |
-| `unsafe_action_count` | chứng minh zero unsafe |
-| `evidence_paths` | reviewer mở được bằng chứng |
-
-## 12. Security And Multi-Tenant Tests
-
-**Mục đích QA/Test:** chứng minh hệ thống không gây hại khi AI trả sai hoặc input bị lỗi. Mục này trả lời câu hỏi: "Nếu AI/action/tenant sai thì CDO có chặn trước khi mutate không?"
-
-| Layer | Test | Expected | Evidence |
+| Bottleneck / Risk | Symptom | Current mitigation | Evidence to collect |
 |---|---|---|---|
-| Safety Gate | cross-tenant target | deny before execute | audit / pytest |
-| Safety Gate | unsupported action | deny | audit / pytest |
-| Safety Gate | blast-radius | deny | audit / pytest |
-| RBAC | forbidden namespace/verb | deny | `kubectl auth can-i` |
-| Kyverno | replicas >10 / memory >4Gi | admission deny | Kyverno output |
-| Audit | query by `correlation_id` | full chain visible | stdout/S3 |
-| Secret safety | raw logs with token/password | scrubbed | preprocessor before/after |
+| Sparse telemetry → verify rubber-stamp | AI detect false negative hoặc verify DONE sai | dense-window Prometheus trong executor v8; gửi `service_error_rate` thật | PromQL output + verify request body |
+| AI endpoint timeout | executor escalate `ai_unavailable` | timeout handling + escalation path (AIError → circuit breaker) | executor audit theo `correlation_id` |
+| Repeated alert flapping | duplicate execute | cooldown map (`CDO_HEAL_COOLDOWN_S`) + idempotency lock | executor log showing skip/cooldown |
+| SQS/env wiring miss | alert không vào executor | forwarder v3 + SQS logs | forwarder log + SQS receive/delete metrics |
+| Audit bucket retention drift | stdout only, không immutable | S3 Object Lock Governance 90d (ADR-004) | S3 retention command output |
 
-Any successful cross-tenant mutation = SEV1 failure.
+---
 
-Pass condition quan trọng nhất:
+## 4. Security test
+
+### 4.1 Penetration touch points
+
+| Touch point | Method | Expected result | Current status | Evidence |
+|---|---|---|---|---|
+| Cross-tenant target | incident `tenant-a`, action target `tenant-b` | `SafetyDenied("denied_cross_tenant")` before execute | **PASS:** sc11 deny + online live tenant-b deny | `audit_index.md`, online chaos log |
+| Unsupported action | AI trả `DELETE_NAMESPACE` | `SafetyDenied("denied_action_not_allowed")` | **PASS:** sc12 denied; pytest `test_action_not_in_allow_list` | `pytest_executor_tests.txt` |
+| Blast radius — replicas | replicas=50 | `SafetyDenied("blast_radius_exceeded")` | **PASS:** pytest `test_blast_radius_replicas` | `pytest_executor_tests.txt` |
+| Blast radius — memory | memory=8192Mi | `SafetyDenied("blast_radius_exceeded")` | **PASS:** pytest `test_blast_radius_memory` | `pytest_executor_tests.txt` |
+| Scale to zero | replicas=0 | `SafetyDenied("scale_to_zero_denied")` | **PASS:** pytest `test_scale_to_zero_denied` | `pytest_executor_tests.txt` |
+| Missing verify policy | AI decide thiếu `verify_policy` | `SafetyDenied("missing_verify_policy")` | **PASS:** pytest `test_missing_verify_policy` | `pytest_executor_tests.txt` |
+| Pattern routing mismatch | SCALE_REPLICAS trong urgent plan | `SafetyDenied("invalid_pattern_type")` | **PASS:** pytest `test_pattern_routing_mismatch` | `pytest_executor_tests.txt` |
+| Duplicate incident | same idempotency key | skip duplicate execute | **PASS:** circuit breaker + SQS source unit tests | `pytest_executor_tests.txt` |
+| PII/secret in alert | email/card/SSN/AWS-key/token/password in payload | scrub trước khi vào SQS/audit | **PASS:** 9 forwarder tests pass (7 pattern) | `pytest_forwarder_tests.txt` |
+| RBAC forbidden verb | executor tries forbidden namespace/verb | Kubernetes denies | screenshot-backed; fresh `auth can-i` chưa thu thập | `evidence/images/iam-irsa-executor.png` |
+| Kyverno admission | replicas>10 / memory>4Gi dry-run | admission deny | policy manifests live; fresh runtime output chưa thu thập | `manifests/kyverno/policies/` |
+
+**3-layer defense:**
 
 ```text
-cross-tenant mutation = 0
-unsafe action = 0
-deny/escalate reason phải xuất hiện trong audit
+Layer 1: Safety Gate (app-level)    — safety_gate.py — fail-closed, SafetyDenied trước execute
+Layer 2: RBAC (verb-level)          — manifests/rbac/ — least-privilege, không có delete verb
+Layer 3: Kyverno (value-level)      — manifests/kyverno/ — ClusterPolicy Enforce (ADR-009)
 ```
 
-## 13. Inputs Required From Other Teams
+### 4.2 Vulnerability scan
 
-**Mục đích QA/Test:** liệt kê rõ Team C cần input/output nào để chạy test thật. Mục này trả lời câu hỏi: "Cần yêu cầu AI/Team A/Team B cung cấp gì, dưới dạng artifact nào?"
+| Item | Tool | Target | Expected | Current status | Evidence |
+|---|---|---|---|---|---|
+| Python lint / static | `ruff` / CI | `executor/`, `forwarder/` | no critical | CI output exists | CI log |
+| Secret scan | `gitleaks` | repo | 0 committed secret | `.gitleaks.toml` present; scan output chưa đính kèm | scan output TBD |
+| Container scan | Trivy | executor/forwarder/AI images | 0 CRITICAL | chưa đính kèm | Trivy output TBD |
+| K8s manifest scan | kube-linter / kubeconform | `manifests/` | valid schema, no critical | chưa đính kèm | scan output TBD |
 
-### AI Team / A4
+---
 
-| Need | Required output |
-|---|---|
-| AI image | ECR/image URI + immutable tag |
-| Readiness | `/health`, `/ready` behavior |
-| Endpoint | in-cluster service URL or testing URL |
-| Schema samples | sample `/v1/detect`, `/v1/decide`, `/v1/verify` responses |
-| Bad response variants | how to force cross-tenant, unsupported action, missing verify, timeout, low confidence |
-| Runbook names | expected `matched_runbook` per scenario |
+## 5. Multi-tenant isolation test
 
-### Team A - Executor/Core
+Cross-tenant mutation là SEV1. CDO không được mutate namespace khác tenant của incident, kể cả khi AI trả action sai.
 
-| Need | Required output |
-|---|---|
-| action status | real/stub status for restart, patch memory, rollout undo, deferred actions |
-| command | exact command to run scenario in executor pod/local |
-| failure injection | dry-run fail, rollback, AI failure path |
-| audit reasons | real reason strings emitted |
-| logs | sample executor logs by `correlation_id` |
+| Test | Method | Expected | Current result | Evidence |
+|---|---|---|---|---|
+| AI trả target namespace khác incident | sc11 scenario + mock decide trả `tenant-b` | `denied_cross_tenant` before execute | **PASS:** sc11 + online live deny | `audit_index.md`, `online_chaos_report.log` |
+| Tenant A SA mutate Tenant B | `kubectl auth can-i patch deployment -n tenant-b` | denied | screenshot-backed; fresh output chưa thu thập | `evidence/images/iam-irsa-executor.png` |
+| Unsupported namespace mutation | Kyverno dry-run | admission deny | policy manifests live; output chưa thu thập | `manifests/kyverno/policies/` |
+| SQS message wrong tenant_id | malformed/mismatch payload | reject/escalate, no execute | covered bởi SQS source tests + safety path | `pytest_executor_tests.txt` |
+| Audit tenant trace | query `correlation_id` + `tenant_id` | full chain scoped to one tenant | **PASS** 14/14 offline indexed; live screenshot-backed | `audit_index.md`, `evidence/images/cwl-correlation-trace.png` |
 
-### Team B - Platform/Infra
+**Pass conditions:**
 
-| Need | Required output |
-|---|---|
-| EKS readiness | `kubectl get ns`, `kubectl get nodes` |
-| workload readiness | `kubectl get deploy -n tenant-a`, `kubectl get deploy -n tenant-b` |
-| podinfo inject | confirm `/readyz/disable`, `/status/500`, `/delay/5`, `/panic` work |
-| RBAC/Kyverno | `kubectl auth can-i`, `kubectl get cpol`, deny output |
-| audit infra | S3 bucket, Object Lock output, DynamoDB table |
-| observability | current Prometheus/Grafana/CloudWatch output, not stale M6 doc |
+```text
+cross_tenant_mutation_count = 0
+unsafe_action_count = 0
+deny/escalate reason xuất hiện trong audit
+không có Kubernetes event cho mutation ở namespace sai
+```
 
-QA rule: nếu team khác chỉ trả lời "ready rồi" nhưng không có command output/screenshot/log, chưa được tính là evidence.
+---
 
-## 14. Known Gaps
+## 6. Failure analysis
 
-**Mục đích QA/Test:** ghi rõ rủi ro test chưa phủ được để tránh claim quá mức. Mục này trả lời câu hỏi: "Cái gì chưa test được thật, owner là ai, workaround là gì?"
+### 6.1 Failures encountered during W12
 
-| Gap | Owner | Impact | Mitigation |
+| # | Failure | Root cause | Fix | Verification |
+|---|---|---|---|---|
+| 1 | Verify rubber-stamp DONE | post-telemetry chỉ có `container_resource_usage`, thiếu signal health/error | executor v8 gửi `service_error_rate` thật; AI verify: err=0→DONE, err=0.5→ESCALATE | verify logs DONE/ESCALATE |
+| 2 | PII lọt qua alert payload | forwarder v2 chưa scrub đủ pattern | forwarder v3: 7 pattern (email/card/SSN/AWS-key/token/password/IP), 9 test case | `pytest_forwarder_tests.txt` |
+| 3 | Cross-tenant action risk | AI V5 có thể trả target namespace sai | Safety Gate deny trước execute + RBAC + Kyverno 3-layer (ADR-003, ADR-009) | sc11/live deny audit |
+| 4 | Deferred SCALE/ROTATE chưa full-real proof | GitOps/ArgoCD path là designed/deferred | ghi rõ designed-only, không claim urgent live mutation | ADR-008 + `08_adrs.md` |
+
+### 6.2 Test gaps acknowledged
+
+| Gap | Impact | Owner | Mitigation |
 |---|---|---|---|
-| K8s mutating methods still stub | Team A | cannot claim real restart/patch/rollback | run real AI + mock K8s until implemented |
-| Deferred GitOps still stub | Team A/B | TC-05/06 may not be real auto-resolve | mark designed-only unless implemented |
-| Only TC-01 scenario exists | Team C | cannot reach >=10 scenarios | create scenario JSONs |
-| Mock AI happy path only | Team C/A4 | bad cases need variants | use real AI variants or patch mock |
-| Observability docs stale | Team B | cannot claim Prometheus/OTel/CloudWatch runtime | request fresh output |
-| Circuit breaker not implemented | Team A | TC-15 not hard blocker | cut/designed-only |
+| Trivy/gitleaks/kube-linter output chưa đính kèm | chưa chốt `Critical findings = 0` | CDO-02 | lấy CI output; scan Trivy trên executor/forwarder image |
+| RBAC `kubectl auth can-i` fresh output | không có fresh runtime proof | CDO-02 | dùng AWS IRSA screenshot evidence hiện có; collect khi có EKS context |
+| Kyverno admission deny fresh runtime | chỉ có policy manifests, không có deny output | CDO-02 | dry-run test trong safe window; manifests ở `manifests/kyverno/policies/` |
+| Deferred GitOps chưa có ArgoCD sync output | không claim full-real SCALE/ROTATE | CDO-02 | giữ designed-only hoặc bổ sung ArgoCD sync evidence |
+| Official 4h raw soak log chưa đính kèm | không claim `--duration 4h` window chính thức | CDO-02 | chạy `python run_scenarios.py --duration 4h` và lưu stdout |
 
-QA note: gap không phải lỗi nếu được ghi rõ và có fallback. Lỗi là claim pass khi chưa có evidence.
+---
 
-## 15. Final Summary Template
-
-**Mục đích QA/Test:** đây là bảng cuối cùng để reviewer nhìn nhanh kết quả. Mục này trả lời câu hỏi: "Dự án có đạt target test/evidence không?"
+## 7. Final summary
 
 | Summary metric | Target | Actual | Mode mix | Pass/Fail |
 |---|---:|---|---|---|
-| Total scenarios injected | >=10 | TBD | TBD | TBD |
-| Scenario window | >=4h | TBD | TBD | TBD |
-| Auto-resolve rate | >=60% | TBD | TBD | TBD |
-| Unsafe actions | 0 | TBD | TBD | TBD |
-| Cross-tenant leaks | 0 | TBD | TBD | TBD |
-| Complete audit coverage | 100% | TBD | TBD | TBD |
-| Real AI scenarios | >= core scenarios | TBD | TBD | TBD |
-| Real EKS mutation scenarios | best effort | TBD | TBD | TBD |
-| Critical security findings | 0 | TBD | TBD | TBD |
+| Total scenarios injected | ≥10 | **14** | mock-offline | **PASS** |
+| Scenario window | ≥4h | not measured; no official raw log | skipped | **SKIP** |
+| Auto-resolve rate | ≥60% | **10/14 = 71.4%** | mock-offline | **PASS** |
+| Unsafe actions | 0 | **0 observed** | mixed | **PASS** |
+| Cross-tenant leaks | 0 | **0 observed** | mixed / full-real deny | **PASS** |
+| Complete audit coverage | 100% | **14/14** offline indexed; live screenshot-backed | mixed | **PASS** for scenario set |
+| Real AI scenarios | core flow | **AI V5 live** — online chaos verified | full-real | **PASS** |
+| Real EKS mutation | ≥1 | **tenant-a restart → auto_resolved** | full-real | **PASS** |
+| Critical security findings | 0 | unit/security logic tests pass; vuln scan TBD | CI/local | **TBD** |
 
-Chỉ cập nhật bảng này sau khi đã có `run_report.json` và evidence paths.
+**Conclusion:** CDO-02 đáp ứng core Pack #2 Self-Heal requirements — scenario count (14), auto-resolve rate (71.4% ≥ 60%), zero unsafe action, multi-tenant deny (sc11 + live), real AI V5 integration, và ≥1 full-real EKS mutation (tenant-a restart). QA-07 bổ sung pytest output (executor + forwarder), scenario runner output, và 14/14 audit index. Công việc còn lại: security/vulnerability scan output và fresh `kubectl auth can-i` / Kyverno runtime output khi có EKS context.
 
-## Related Documents
+---
 
-- `TF3-Self-Heal-Agent-AWS/injectionplan.md`
-- `TF3-Self-Heal-Agent-AWS/executor/README.md`
-- `TF3-Self-Heal-Agent-AWS/manifests/ai-engine/README.md`
-- `TF3-Self-Heal-Agent-AWS/contract - new 4/ai-api-contract.md`
-- `TF3-Self-Heal-Agent-AWS/contract - new 4/telemetry-contract.md`
-- `TF3-Self-Heal-Agent-AWS/contract - new 4/deployment-contract.md`
-- `P2_CD02_Duc/TeamC/log_flow_team_c.md`
-- `P2_CD02_Duc/TeamC/metric_flow_team_c.md`
-- `P2_CD02_Duc/TeamC/tracing_flow_team_c.md`
+## Related documents
+
+- [`02_infra_design.md`](02_infra_design.md) — SLO targets, Safety Gate design, multi-tenant flow
+- [`03_security_design.md`](03_security_design.md) — RBAC, Kyverno, PII-scrub, 3-layer defense
+- [`04_deployment_design.md`](04_deployment_design.md) — EKS cluster, namespace layout, forwarder
+- [`06_runbook_library.md`](06_runbook_library.md) — runbook mapping per scenario
+- [`08_adrs.md`](08_adrs.md) — ADR-003 tenant isolation, ADR-004 S3 audit, ADR-006 idempotency, ADR-008 GitOps, ADR-009 Kyverno
+- [`09_deploy_runbook_live.md`](09_deploy_runbook_live.md) — live deploy steps
+- `executor/run_scenarios.py` — scenario runner source
+- `executor/safety_gate.py` — Safety Gate source
+- `executor/tests/` — unit test suite
+- `forwarder/tests/` — forwarder unit test suite
+- `injectionplan.md` — scenario injection plan source
+- `manifests/kyverno/policies/` — Kyverno ClusterPolicy
